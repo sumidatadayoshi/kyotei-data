@@ -1,0 +1,45 @@
+name: Daily Boatrace Scrape
+
+on:
+  schedule:
+    # 毎日 UTC 14:30 = 日本時間(JST, UTC+9) 23:30
+    - cron: "30 14 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: boatrace-daily-scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper (today, JST基準)
+        run: python boatrace_scraper.py --when today --interval 1.5
+
+      - name: Commit and push data changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/boatrace.db
+          if git diff --cached --quiet; then
+            echo "No data changes to commit."
+          else
+            git commit -m "chore: update boatrace data ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            git push
+          fi
