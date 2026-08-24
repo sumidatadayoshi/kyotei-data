@@ -55,6 +55,19 @@ JCD_NAMES = {
 
 MAX_RACES_PER_VENUE = 12
 
+# レース格付け(heading2_titleのCSSクラスから判定)。
+# is-ippan / is-G3b は実データで確認済み。is-sg / is-g1 / is-g2 は
+# サイトのナビゲーション表記(「SG・PG1」「G1・G2」「G3」)からの類推であり、
+# 実際にSG/G1/G2開催があった際に検証が必要。
+GRADE_CLASS_PREFIXES = [
+    ("is-sg", "SG"),
+    ("is-pg1", "SG"),
+    ("is-g1", "G1"),
+    ("is-g2", "G2"),
+    ("is-g3", "G3"),
+    ("is-ippan", "一般"),
+]
+
 # 対象日が「終了しているはずの日」の場合に、結果取得率がこれを下回ると
 # scrape_logのstatusを'partial'にし、mainの終了コードを1にする。
 RESULTS_COMPLETENESS_THRESHOLD = 0.9
@@ -100,6 +113,20 @@ def extract_number(s):
         return None
     m = re.search(r"-?\d+(\.\d+)?", s)
     return float(m.group()) if m else None
+
+
+def extract_grade(soup):
+    """racelist/raceresultページ共通の .heading2_title のCSSクラスから
+    レース格付け(SG/G1/G2/G3/一般)を判定する。"""
+    div = soup.select_one(".heading2_title")
+    if not div:
+        return None
+    classes = [c.lower() for c in (div.get("class") or [])]
+    for cls in classes:
+        for prefix, label in GRADE_CLASS_PREFIXES:
+            if cls.startswith(prefix):
+                return label
+    return None
 
 
 class PoliteSession:
@@ -258,7 +285,7 @@ def parse_racelist_header(html_text):
     soup = BeautifulSoup(html_text, "lxml")
 
     race_info = {
-        "title": None, "race_type": None, "distance": None,
+        "title": None, "race_type": None, "distance": None, "grade": None,
         "venue_name": None, "weather": None, "temperature": None,
         "wind_speed": None, "water_temp": None, "wave_height": None,
         "kimarite": None,
@@ -267,6 +294,8 @@ def parse_racelist_header(html_text):
     h2 = soup.select_one(".heading2_titleName")
     if h2:
         race_info["title"] = nfkc(h2.get_text(strip=True))
+
+    race_info["grade"] = extract_grade(soup)
 
     img = soup.select_one(".heading2_area img")
     if img and img.get("alt"):
@@ -292,7 +321,7 @@ def parse_race_result(html_text):
     soup = BeautifulSoup(html_text, "lxml")
 
     race_info = {
-        "title": None, "race_type": None, "distance": None,
+        "title": None, "race_type": None, "distance": None, "grade": None,
         "venue_name": None, "weather": None, "temperature": None,
         "wind_speed": None, "water_temp": None, "wave_height": None,
         "kimarite": None,
@@ -301,6 +330,8 @@ def parse_race_result(html_text):
     h2 = soup.select_one(".heading2_titleName")
     if h2:
         race_info["title"] = nfkc(h2.get_text(strip=True))
+
+    race_info["grade"] = extract_grade(soup)
 
     img = soup.select_one(".heading2_area img")
     if img and img.get("alt"):
@@ -442,6 +473,7 @@ CREATE TABLE IF NOT EXISTS races (
     title TEXT,
     race_type TEXT,
     distance TEXT,
+    grade TEXT,
     weather TEXT,
     temperature REAL,
     wind_speed REAL,
@@ -461,6 +493,7 @@ CREATE TABLE IF NOT EXISTS entries (
     toban TEXT,
     racer_class TEXT,
     racer_name TEXT,
+    gender TEXT,
     branch TEXT,
     hometown TEXT,
     age INTEGER,
@@ -521,42 +554,70 @@ CREATE TABLE IF NOT EXISTS scrape_log (
     status TEXT,
     PRIMARY KEY (race_date, started_at)
 );
+
+CREATE TABLE IF NOT EXISTS female_racers (
+    toban TEXT PRIMARY KEY,
+    racer_name TEXT,
+    fetched_at TEXT
+);
 """
+
+# 既存DBに後から追加した列。(table, column,型) のリストで、
+# 存在しなければ ALTER TABLE ADD COLUMN する。
+SCHEMA_MIGRATIONS = [
+    ("races", "grade", "TEXT"),
+    ("entries", "gender", "TEXT"),
+]
 
 
 def get_connection(db_path):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
+    for table, column, coltype in SCHEMA_MIGRATIONS:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    conn.commit()
     return conn
 
 
 def save_race(conn, race_date, jcd, venue_name, rno, race_info, fetched_at):
     conn.execute(
         """INSERT OR REPLACE INTO races
-        (race_date, jcd, venue_name, rno, title, race_type, distance,
+        (race_date, jcd, venue_name, rno, title, race_type, distance, grade,
          weather, temperature, wind_speed, water_temp, wave_height, kimarite, fetched_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (race_date, jcd, venue_name, rno, race_info.get("title"), race_info.get("race_type"),
-         race_info.get("distance"), race_info.get("weather"), race_info.get("temperature"),
-         race_info.get("wind_speed"), race_info.get("water_temp"), race_info.get("wave_height"),
-         race_info.get("kimarite"), fetched_at),
+         race_info.get("distance"), race_info.get("grade"), race_info.get("weather"),
+         race_info.get("temperature"), race_info.get("wind_speed"), race_info.get("water_temp"),
+         race_info.get("wave_height"), race_info.get("kimarite"), fetched_at),
     )
 
 
-def save_entries(conn, race_date, jcd, venue_name, rno, entries, fetched_at):
+def get_female_toban_set(conn):
+    """female_racersテーブルから女性選手の登番集合を取得する。"""
+    return {row[0] for row in conn.execute("SELECT toban FROM female_racers").fetchall()}
+
+
+def save_entries(conn, race_date, jcd, venue_name, rno, entries, fetched_at, female_tobans=None):
+    if female_tobans is None:
+        female_tobans = get_female_toban_set(conn)
     for e in entries:
+        gender = None
+        if e["toban"]:
+            gender = "女" if e["toban"] in female_tobans else "男"
         conn.execute(
             """INSERT OR REPLACE INTO entries
-            (race_date, jcd, venue_name, rno, waku, toban, racer_class, racer_name, branch, hometown,
+            (race_date, jcd, venue_name, rno, waku, toban, racer_class, racer_name, gender, branch, hometown,
              age, weight, f_count, l_count, avg_st,
              national_win_rate, national_2rate, national_3rate,
              local_win_rate, local_2rate, local_3rate,
              motor_no, motor_2rate, motor_3rate,
              boat_no, boat_2rate, boat_3rate, fetched_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (race_date, jcd, venue_name, rno, e["waku"], e["toban"], e["racer_class"], e["racer_name"],
-             e["branch"], e["hometown"], e["age"], e["weight"], e["f_count"], e["l_count"],
+             gender, e["branch"], e["hometown"], e["age"], e["weight"], e["f_count"], e["l_count"],
              e["avg_st"], e["national_win_rate"], e["national_2rate"], e["national_3rate"],
              e["local_win_rate"], e["local_2rate"], e["local_3rate"], e["motor_no"],
              e["motor_2rate"], e["motor_3rate"], e["boat_no"], e["boat_2rate"], e["boat_3rate"],
@@ -589,6 +650,153 @@ def save_payouts(conn, race_date, jcd, venue_name, rno, payouts, fetched_at):
 
 
 # ---------------------------------------------------------------------------
+# 選手の性別: 公式サイトの「ボートレーサー検索」で性別=女性を検索し、
+# 登録されている女性選手の登番一覧を取得する。男性の一覧は取得せず、
+# 「この一覧に無ければ男性」として扱う(男性/女性の二択のため)。
+# ---------------------------------------------------------------------------
+
+RACER_SEARCH_URL = f"{BASE_URL}/owpc/pc/data/racersearch/index"
+RACER_SEARCH_RESULT_URL = f"{BASE_URL}/owpc/pc/data/racersearch/result"
+
+
+def fetch_female_racers(session):
+    """性別=女性で選手検索し、(toban, racer_name)のリストをページネーション込みで
+    全件取得する。"""
+    resp = session.session.post(
+        RACER_SEARCH_URL,
+        data={
+            "TDATP310A_2": "TDATP310A_2",
+            "TDATP310A_2:inBoatracerName": "",
+            "TDATP310A_2:inTobanLeft": "",
+            "TDATP310A_2:inTobanRight": "",
+            "TDATP310A_2:inCultivationTerm": "",
+            "TDATP310A_2:TDATP310A_3": "SELECTALL",
+            "TDATP310A_2:TDATP310A_4": "SELECTALL",
+            "TDATP310A_2:TDATP310A_5": "SELECTALL",
+            "TDATP310A_2:TDATP310A_6": "2",  # 性別: 2=女性
+            "TDATP310A_2:TDATP310A_7": "検索",
+            "javax.faces.ViewState": "stateless",
+        },
+        headers=HEADERS,
+        timeout=session.timeout,
+    )
+    resp.encoding = "utf-8"
+
+    racers = {}
+
+    def collect(html_text):
+        soup = BeautifulSoup(html_text, "lxml")
+        for a in soup.select('a[href*="racersearch/profile?toban="]'):
+            m = re.search(r"toban=(\d+)", a["href"])
+            if not m:
+                continue
+            toban = m.group(1)
+            body = a.find_parent("li")
+            name = None
+            if body:
+                name_tag = body.select_one(".photoGallery3_bodyName")
+                if name_tag:
+                    name = nfkc(name_tag.get_text(strip=True))
+            racers[toban] = name
+        # ページネーションリンク(orteusPageSelectBeginRow=N)を全て集める
+        pages = set()
+        for a in soup.select('a[href*="orteusPageSelectBeginRow="]'):
+            pages.add(a["href"])
+        return pages
+
+    pages_to_visit = collect(resp.text)
+    visited = set()
+    while pages_to_visit:
+        href = pages_to_visit.pop()
+        if href in visited:
+            continue
+        visited.add(href)
+        time.sleep(session.interval_sec)
+        page_resp = session.session.get(f"{BASE_URL}{href}", headers=HEADERS, timeout=session.timeout)
+        page_resp.encoding = "utf-8"
+        more_pages = collect(page_resp.text)
+        pages_to_visit |= (more_pages - visited)
+
+    return [(toban, name) for toban, name in racers.items()]
+
+
+def update_female_racers(db_path, interval_sec=1.5):
+    """female_racersテーブルを公式サイトの検索結果で更新する。
+    数が少なく変化も緩やかなため、日次ジョブの一部として毎回実行しても軽い。"""
+    session = PoliteSession(interval_sec=interval_sec)
+    conn = get_connection(db_path)
+
+    racers = fetch_female_racers(session)
+    fetched_at = datetime.now().isoformat(timespec="seconds")
+    for toban, name in racers:
+        conn.execute(
+            "INSERT OR REPLACE INTO female_racers (toban, racer_name, fetched_at) VALUES (?,?,?)",
+            (toban, name, fetched_at),
+        )
+    conn.commit()
+
+    # 新たに判明した女性選手を、既存entriesの性別にも反映する
+    conn.execute("UPDATE entries SET gender = '女' WHERE toban IN (SELECT toban FROM female_racers)")
+    conn.execute("UPDATE entries SET gender = '男' WHERE gender IS NULL AND toban IS NOT NULL")
+    conn.commit()
+    conn.close()
+
+    logger.info("女性選手一覧を更新しました: %d名", len(racers))
+    return len(racers)
+
+
+# ---------------------------------------------------------------------------
+# 過去レースのグレード補完: races.gradeが未取得(NULL)の行について、
+# 対応するraceresult(結果があれば)/racelist(無ければ)ページを再取得して
+# gradeだけを補完する。entries/results/payoutsは触らない。
+# ---------------------------------------------------------------------------
+
+def backfill_grades(db_path, interval_sec=1.5):
+    session = PoliteSession(interval_sec=interval_sec)
+    conn = get_connection(db_path)
+
+    targets = conn.execute(
+        "SELECT race_date, jcd, rno FROM races WHERE grade IS NULL ORDER BY race_date, jcd, rno"
+    ).fetchall()
+    if not targets:
+        logger.info("グレード補完対象のレースはありません。")
+        conn.close()
+        return 0
+
+    updated = 0
+    for race_date, jcd, rno in targets:
+        has_result = conn.execute(
+            "SELECT 1 FROM results WHERE race_date=? AND jcd=? AND rno=? LIMIT 1",
+            (race_date, jcd, rno),
+        ).fetchone()
+
+        if has_result:
+            url = f"{BASE_URL}/owpc/pc/race/raceresult?rno={rno}&jcd={jcd}&hd={race_date}"
+        else:
+            url = f"{BASE_URL}/owpc/pc/race/racelist?rno={rno}&jcd={jcd}&hd={race_date}"
+
+        html_text = session.get(url)
+        if html_text is None:
+            logger.warning("グレード補完のための取得に失敗: date=%s jcd=%s rno=%s", race_date, jcd, rno)
+            continue
+
+        soup = BeautifulSoup(html_text, "lxml")
+        grade = extract_grade(soup)
+        conn.execute(
+            "UPDATE races SET grade=? WHERE race_date=? AND jcd=? AND rno=?",
+            (grade, race_date, jcd, rno),
+        )
+        conn.commit()
+        updated += 1
+        if updated % 20 == 0:
+            logger.info("グレード補完: %d/%d件完了", updated, len(targets))
+
+    conn.close()
+    logger.info("グレード補完完了: %d/%d件", updated, len(targets))
+    return updated
+
+
+# ---------------------------------------------------------------------------
 # メイン処理
 # ---------------------------------------------------------------------------
 
@@ -596,6 +804,7 @@ def scrape_day(date_str, db_path, interval_sec=1.5):
     session = PoliteSession(interval_sec=interval_sec)
     conn = get_connection(db_path)
     started_at = datetime.now().isoformat(timespec="seconds")
+    female_tobans = get_female_toban_set(conn)
 
     venues = get_active_venues(session, date_str)
     if not venues:
@@ -619,7 +828,7 @@ def scrape_day(date_str, db_path, interval_sec=1.5):
                 break
 
             fetched_at = datetime.now().isoformat(timespec="seconds")
-            save_entries(conn, date_str, jcd, venue_name_fallback, rno, entries, fetched_at)
+            save_entries(conn, date_str, jcd, venue_name_fallback, rno, entries, fetched_at, female_tobans)
 
             raceresult_url = f"{BASE_URL}/owpc/pc/race/raceresult?rno={rno}&jcd={jcd}&hd={date_str}"
             raceresult_html = session.get(raceresult_url)
@@ -696,6 +905,7 @@ def scrape_today_entries(date_str, db_path, interval_sec=1.5):
     session = PoliteSession(interval_sec=interval_sec)
     conn = get_connection(db_path)
     started_at = datetime.now().isoformat(timespec="seconds")
+    female_tobans = get_female_toban_set(conn)
 
     venues = get_active_venues(session, date_str)
     if not venues:
@@ -722,7 +932,7 @@ def scrape_today_entries(date_str, db_path, interval_sec=1.5):
             venue_name = race_info.get("venue_name") or venue_name_fallback
             fetched_at = datetime.now().isoformat(timespec="seconds")
 
-            save_entries(conn, date_str, jcd, venue_name, rno, entries, fetched_at)
+            save_entries(conn, date_str, jcd, venue_name, rno, entries, fetched_at, female_tobans)
             save_race(conn, date_str, jcd, venue_name, rno, race_info, fetched_at)
             conn.commit()
 
@@ -755,6 +965,16 @@ def main():
         help="結果が出る前の出走表のみを取得する(「今日のおすすめ」機能向け)。"
              "resultsやpayoutsは取得せず、完全性チェックも行わない。",
     )
+    parser.add_argument(
+        "--update-female-racers", action="store_true",
+        help="女性選手一覧(female_racersテーブル)を公式サイトの検索結果で更新し、"
+             "既存entriesのgenderにも反映して終了する。他の取得は行わない。",
+    )
+    parser.add_argument(
+        "--backfill-grades", action="store_true",
+        help="racesテーブルでgradeが未取得(NULL)の行について、該当ページを"
+             "再取得してgradeだけを補完し終了する。他の取得は行わない。",
+    )
     args = parser.parse_args()
 
     if args.date:
@@ -773,6 +993,16 @@ def main():
             logging.StreamHandler(sys.stdout),
         ],
     )
+
+    if args.update_female_racers:
+        logger.info("女性選手一覧の更新開始: db=%s", args.db)
+        update_female_racers(args.db, interval_sec=args.interval)
+        return
+
+    if args.backfill_grades:
+        logger.info("グレード補完開始: db=%s", args.db)
+        backfill_grades(args.db, interval_sec=args.interval)
+        return
 
     if args.entries_only:
         logger.info("BOATRACE出走表取得開始(結果は取得しない): date=%s db=%s interval=%.1fs", date_str, args.db, args.interval)

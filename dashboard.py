@@ -110,18 +110,45 @@ def add_rate_labels(candidates, c1_stats, c2_stats):
     return candidates
 
 
+def classify_composition(genders):
+    """レース1走分の6艇のgender集合から、性別構成(混合戦/女子戦/男子戦)を判定する。
+    genderが未取得の選手が1人でもいる場合は判定不能としてNoneを返す。"""
+    genders = set(g for g in genders if g)
+    if not genders:
+        return None
+    if genders == {"女"}:
+        return "女子戦"
+    if genders == {"男"}:
+        return "男子戦"
+    return "混合戦"
+
+
 st.title("🚤 BOATRACE データ確認ダッシュボード")
 st.caption("取得済みデータの中身をレース単位で目視確認するための簡易ツールです。")
 
 conn = get_connection()
 
-entries_all = load_df("SELECT race_date, jcd, rno, waku, toban, racer_name, venue_name FROM entries")
+entries_all = load_df("SELECT race_date, jcd, rno, waku, toban, racer_name, gender, venue_name FROM entries")
 results_all = load_df("SELECT race_date, jcd, rno, waku, rank FROM results")
+races_grades = load_df("SELECT race_date, jcd, rno, grade FROM races")
 
 if not entries_all.empty and not results_all.empty:
     c1_stats, c2_stats, waku1_rank = compute_racer_rate_stats(entries_all, results_all)
 else:
     c1_stats = c2_stats = waku1_rank = None
+
+# レースごとの性別構成(混合戦/女子戦/男子戦)。グレードと合わせて
+# 絞り込みフィルターや各表の付加情報として使う。
+if not entries_all.empty:
+    race_composition = (
+        entries_all.groupby(["race_date", "jcd", "rno"])["gender"]
+        .apply(classify_composition)
+        .reset_index(name="composition")
+    )
+else:
+    race_composition = pd.DataFrame(columns=["race_date", "jcd", "rno", "composition"])
+
+race_meta = races_grades.merge(race_composition, on=["race_date", "jcd", "rno"], how="left")
 
 # ---------------------------------------------------------------------------
 # 🎯 今日のおすすめ
@@ -152,9 +179,15 @@ else:
         st.info("本日は条件に合うレースがありません。")
     else:
         today_candidates = add_rate_labels(today_candidates, c1_stats, c2_stats)
+        today_candidates = today_candidates.merge(
+            race_meta[["race_date", "jcd", "rno", "grade", "composition"]],
+            on=["race_date", "jcd", "rno"], how="left",
+        )
+        today_candidates["グレード"] = today_candidates["grade"].fillna("不明")
+        today_candidates["性別構成"] = today_candidates["composition"].fillna("不明")
         display_df = today_candidates.rename(
             columns={"venue_name": "場", "rno": "R", "racer1_name": "1号艇選手", "racer2_name": "2号艇選手"}
-        )[["場", "R", "1号艇選手", "1号艇イン逃げ率", "2号艇選手", "2号艇逃し率"]]
+        )[["場", "R", "グレード", "性別構成", "1号艇選手", "1号艇イン逃げ率", "2号艇選手", "2号艇逃し率"]]
         st.dataframe(display_df, hide_index=True, use_container_width=True)
         st.caption(
             "①1号艇イン逃げ率80%以上 かつ ②2号艇逃し率50%以上 の条件に合致したレースです。"
@@ -194,10 +227,14 @@ selected_venue_label = st.sidebar.selectbox("場", list(venue_options.keys()))
 selected_jcd = venue_options[selected_venue_label]
 
 races_df = load_df(
-    """SELECT rno, title, race_type, distance, weather, temperature,
+    """SELECT race_date, rno, title, race_type, distance, grade, weather, temperature,
               wind_speed, water_temp, wave_height, kimarite
        FROM races WHERE race_date = ? AND jcd = ? ORDER BY rno""",
     (selected_date, selected_jcd),
+)
+races_df = races_df.merge(
+    race_composition[race_composition["jcd"] == selected_jcd][["race_date", "rno", "composition"]],
+    on=["race_date", "rno"], how="left",
 )
 
 race_options = {f"{row.rno}R": row.rno for row in races_df.itertuples()}
@@ -216,11 +253,14 @@ venue_summary = load_df(
 st.dataframe(venue_summary, hide_index=True, use_container_width=True)
 
 st.subheader(f"🏁 {selected_venue_label} レース一覧")
-race_list_display = races_df.rename(columns={
+race_list_display = races_df.drop(columns=["race_date"]).rename(columns={
     "rno": "R", "title": "タイトル", "race_type": "種別", "distance": "距離",
+    "grade": "グレード", "composition": "性別構成",
     "weather": "天候", "temperature": "気温", "wind_speed": "風速",
     "water_temp": "水温", "wave_height": "波高", "kimarite": "決まり手",
 })
+race_list_display["グレード"] = race_list_display["グレード"].fillna("不明")
+race_list_display["性別構成"] = race_list_display["性別構成"].fillna("不明")
 st.dataframe(race_list_display, hide_index=True, use_container_width=True)
 
 # ---------------------------------------------------------------------------
@@ -229,7 +269,10 @@ st.dataframe(race_list_display, hide_index=True, use_container_width=True)
 st.divider()
 race_row = races_df[races_df["rno"] == selected_rno].iloc[0]
 st.header(f"{selected_venue_label} {selected_rno}R の詳細")
-st.write(f"**{race_row['title'] or ''}** / {race_row['race_type'] or ''} {race_row['distance'] or ''}")
+st.write(
+    f"**{race_row['title'] or ''}** / {race_row['race_type'] or ''} {race_row['distance'] or ''} / "
+    f"グレード: {race_row['grade'] or '不明'} / 性別構成: {race_row['composition'] or '不明'}"
+)
 
 cols = st.columns(5)
 cols[0].metric("天候", race_row["weather"] or "-")
@@ -242,7 +285,7 @@ tab_entries, tab_results, tab_payouts = st.tabs(["出走表", "結果", "払戻�
 
 with tab_entries:
     entries_df = load_df(
-        """SELECT waku AS 枠, racer_name AS 選手名, racer_class AS 級別, toban AS 登番,
+        """SELECT waku AS 枠, racer_name AS 選手名, gender AS 性別, racer_class AS 級別, toban AS 登番,
                   branch AS 支部, hometown AS 出身地, age AS 年齢, weight AS 体重,
                   f_count AS F数, l_count AS L数, avg_st AS 平均ST,
                   national_win_rate AS 全国勝率, national_2rate AS 全国2連率, national_3rate AS 全国3連率,
@@ -284,6 +327,38 @@ with tab_payouts:
 st.divider()
 
 # ---------------------------------------------------------------------------
+# 🔍 絞り込み(グレード・性別構成)
+#
+# 以下の「イン逃げ狙い目レース分析」「回収率シミュレーター」共通の
+# 絞り込み条件。デフォルト(全選択/すべて)では従来と同じ全レースが
+# 対象になり、既存の集計結果は変わらない。
+# ---------------------------------------------------------------------------
+st.subheader("🔍 絞り込み(グレード・性別構成)")
+st.caption("この下の「イン逃げ狙い目レース分析」と「回収率シミュレーター」の両方に適用されます。")
+
+GRADE_ORDER = ["SG", "G1", "G2", "G3", "一般"]
+present_grades = set(races_grades["grade"].dropna())
+grade_options = [g for g in GRADE_ORDER if g in present_grades]
+if races_grades["grade"].isna().any():
+    grade_options = grade_options + ["不明"]
+
+f1, f2 = st.columns([2, 1])
+selected_grades = f1.multiselect("グレード", grade_options, default=grade_options)
+composition_choice = f2.selectbox("性別構成", ["すべて", "混合戦", "女子戦", "男子戦"])
+
+race_meta_filtered = race_meta.copy()
+race_meta_filtered["grade_label"] = race_meta_filtered["grade"].fillna("不明")
+race_meta_filtered = race_meta_filtered[race_meta_filtered["grade_label"].isin(selected_grades)]
+if composition_choice != "すべて":
+    race_meta_filtered = race_meta_filtered[race_meta_filtered["composition"] == composition_choice]
+
+entries_filtered = entries_all.merge(
+    race_meta_filtered[["race_date", "jcd", "rno"]], on=["race_date", "jcd", "rno"], how="inner"
+)
+
+st.divider()
+
+# ---------------------------------------------------------------------------
 # イン逃げ狙い目レース分析(実験的機能・全期間)
 #
 # 「🎯 今日のおすすめ」と同じ条件・同じ選手統計(c1_stats/c2_stats)を使い、
@@ -306,7 +381,7 @@ st.caption(
 if c1_stats is None:
     st.info("分析に必要なデータがまだありません。")
 else:
-    candidates = find_qualifying_races(entries_all, c1_stats, c2_stats)
+    candidates = find_qualifying_races(entries_filtered, c1_stats, c2_stats)
 
     st.subheader(f"条件に合致したレース: {len(candidates)}件")
     if candidates.empty:
@@ -314,9 +389,13 @@ else:
     else:
         candidates = add_rate_labels(candidates, c1_stats, c2_stats)
         candidates["日付"] = candidates["race_date"].apply(fmt_date)
+        candidates = candidates.merge(race_meta[["race_date", "jcd", "rno", "grade", "composition"]],
+                                       on=["race_date", "jcd", "rno"], how="left")
+        candidates["グレード"] = candidates["grade"].fillna("不明")
+        candidates["性別構成"] = candidates["composition"].fillna("不明")
         display_df = candidates.rename(
             columns={"venue_name": "場", "rno": "R", "racer1_name": "1号艇選手", "racer2_name": "2号艇選手"}
-        )[["日付", "場", "R", "1号艇選手", "1号艇イン逃げ率", "2号艇選手", "2号艇逃し率"]]
+        )[["日付", "場", "R", "グレード", "性別構成", "1号艇選手", "1号艇イン逃げ率", "2号艇選手", "2号艇逃し率"]]
         st.dataframe(display_df, hide_index=True, use_container_width=True)
 
     st.subheader("③ 実際に1号艇が逃げた場合の2連単 上位3")
@@ -374,7 +453,7 @@ BET_AMOUNT = 100
 if c1_stats is None:
     st.info("分析に必要なデータがまだありません。")
 else:
-    sim_candidates = find_qualifying_races(entries_all, c1_stats, c2_stats)
+    sim_candidates = find_qualifying_races(entries_filtered, c1_stats, c2_stats)
 
     if sim_candidates.empty:
         st.info("条件に合致するレースがないため、シミュレーションできません。")

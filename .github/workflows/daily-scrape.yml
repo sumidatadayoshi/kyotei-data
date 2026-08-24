@@ -35,7 +35,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Update female racer list
+        # entries.genderの判定に使う女性選手一覧を更新する。287名程度で
+        # 数の変化も緩やかなため、日次ジョブの一部として毎回実行しても軽い。
+        # 後続のentries保存(gender判定)が最新の一覧を使えるよう、最初に実行する。
+        run: python boatrace_scraper.py --update-female-racers --interval 1.5
+
       - name: Run scraper (yesterday, JST基準)
+        if: always()
         run: python boatrace_scraper.py --when yesterday --interval 1.5
 
       - name: Run scraper (today's racelist only, JST基準)
