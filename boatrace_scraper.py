@@ -251,6 +251,39 @@ def parse_entries(html_text):
     return entries
 
 
+def parse_racelist_header(html_text):
+    """出走表(racelist)ページのヘッダー部から title/venue_name/race_type/distance を取る。
+    結果(raceresult)ページと共通のテンプレートなのでセレクタは同じ。
+    レース前のため天候・決まり手などは含まれない。"""
+    soup = BeautifulSoup(html_text, "lxml")
+
+    race_info = {
+        "title": None, "race_type": None, "distance": None,
+        "venue_name": None, "weather": None, "temperature": None,
+        "wind_speed": None, "water_temp": None, "wave_height": None,
+        "kimarite": None,
+    }
+
+    h2 = soup.select_one(".heading2_titleName")
+    if h2:
+        race_info["title"] = nfkc(h2.get_text(strip=True))
+
+    img = soup.select_one(".heading2_area img")
+    if img and img.get("alt"):
+        race_info["venue_name"] = img.get("alt").strip()
+
+    detail = soup.select_one(".title16_titleDetail__add2020")
+    if detail:
+        parts = [nfkc(l) for l in detail.get_text("\n", strip=True).split("\n") if l.strip()]
+        if parts:
+            race_info["race_type"] = parts[0]
+        for p in parts[1:]:
+            if p.endswith("m"):
+                race_info["distance"] = p
+
+    return race_info
+
+
 # ---------------------------------------------------------------------------
 # 結果 (raceresult) の解析: 着順・払戻金・気象・決まり手
 # ---------------------------------------------------------------------------
@@ -656,6 +689,58 @@ def scrape_day(date_str, db_path, interval_sec=1.5):
     return len(venues), races_count, status
 
 
+def scrape_today_entries(date_str, db_path, interval_sec=1.5):
+    """レース開始前の出走表のみを取得する。結果(raceresult)ページはまだ
+    存在しないため取得しない。「今日のおすすめ」機能向けに、当日の朝など
+    レース前のタイミングで実行することを想定している。"""
+    session = PoliteSession(interval_sec=interval_sec)
+    conn = get_connection(db_path)
+    started_at = datetime.now().isoformat(timespec="seconds")
+
+    venues = get_active_venues(session, date_str)
+    if not venues:
+        logger.warning("開催中のレース場が見つかりませんでした (date=%s)", date_str)
+
+    races_count = 0
+    for jcd, event_title in venues:
+        venue_name_fallback = JCD_NAMES.get(jcd, jcd)
+        logger.info("=== [出走表のみ] %s会場 (jcd=%s) %s ===", venue_name_fallback, jcd, event_title)
+
+        for rno in range(1, MAX_RACES_PER_VENUE + 1):
+            racelist_url = f"{BASE_URL}/owpc/pc/race/racelist?rno={rno}&jcd={jcd}&hd={date_str}"
+            racelist_html = session.get(racelist_url)
+            if racelist_html is None:
+                logger.warning("出走表取得失敗: jcd=%s rno=%s", jcd, rno)
+                continue
+
+            entries = parse_entries(racelist_html)
+            if len(entries) < 6:
+                logger.info("jcd=%s %dRは出走データなし。以降のレースをスキップします。", jcd, rno)
+                break
+
+            race_info = parse_racelist_header(racelist_html)
+            venue_name = race_info.get("venue_name") or venue_name_fallback
+            fetched_at = datetime.now().isoformat(timespec="seconds")
+
+            save_entries(conn, date_str, jcd, venue_name, rno, entries, fetched_at)
+            save_race(conn, date_str, jcd, venue_name, rno, race_info, fetched_at)
+            conn.commit()
+
+            races_count += 1
+            logger.info("jcd=%s %dR 出走表保存完了 (entries=%d)", jcd, rno, len(entries))
+
+    finished_at = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT OR REPLACE INTO scrape_log (race_date, started_at, finished_at, venues_count, races_count, status) "
+        "VALUES (?,?,?,?,?,?)",
+        (date_str, started_at, finished_at, len(venues), races_count, "entries_only"),
+    )
+    conn.commit()
+    conn.close()
+    logger.info("完了(出走表のみ): %s (会場数=%d, レース数=%d)", date_str, len(venues), races_count)
+    return len(venues), races_count
+
+
 def main():
     parser = argparse.ArgumentParser(description="BOATRACE公式サイトから日次データを取得しSQLiteに保存する")
     parser.add_argument("--date", help="取得対象日 (YYYYMMDD)。--whenより優先。")
@@ -665,6 +750,11 @@ def main():
     parser.add_argument("--db", default=str(Path(__file__).parent / "data" / "boatrace.db"), help="SQLiteファイルのパス")
     parser.add_argument("--interval", type=float, default=1.5, help="リクエスト間隔(秒)。デフォルト1.5秒。")
     parser.add_argument("--log", default=str(Path(__file__).parent / "data" / "scraper.log"), help="ログファイルのパス")
+    parser.add_argument(
+        "--entries-only", action="store_true",
+        help="結果が出る前の出走表のみを取得する(「今日のおすすめ」機能向け)。"
+             "resultsやpayoutsは取得せず、完全性チェックも行わない。",
+    )
     args = parser.parse_args()
 
     if args.date:
@@ -683,6 +773,11 @@ def main():
             logging.StreamHandler(sys.stdout),
         ],
     )
+
+    if args.entries_only:
+        logger.info("BOATRACE出走表取得開始(結果は取得しない): date=%s db=%s interval=%.1fs", date_str, args.db, args.interval)
+        scrape_today_entries(date_str, args.db, interval_sec=args.interval)
+        return
 
     logger.info("BOATRACEデータ取得開始: date=%s db=%s interval=%.1fs", date_str, args.db, args.interval)
     _, _, status = scrape_day(date_str, args.db, interval_sec=args.interval)

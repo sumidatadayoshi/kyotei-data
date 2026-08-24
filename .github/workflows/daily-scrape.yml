@@ -38,6 +38,14 @@ jobs:
       - name: Run scraper (yesterday, JST基準)
         run: python boatrace_scraper.py --when yesterday --interval 1.5
 
+      - name: Run scraper (today's racelist only, JST基準)
+        # 出走表は前日17〜22時頃までに各場で公開されるため、JST 6:00の
+        # 実行時点では当日分の出走表は既に取得可能。結果はまだ出ていない
+        # ため取得しない(「今日のおすすめ」機能向け)。
+        # 前段のステップが失敗していても、当日分の出走表取得は独立して試みる。
+        if: always()
+        run: python boatrace_scraper.py --when today --entries-only --interval 1.5
+
       - name: Commit and push data changes
         if: always()
         run: |

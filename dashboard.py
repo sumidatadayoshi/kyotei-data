@@ -2,19 +2,30 @@
 BOATRACEデータの動作確認用ダッシュボード。
 
 取得したデータ(出走表・結果・払戻金)が正しく保存されているかを
-目視確認することが目的。統計分析はまだ実装しない。
+目視確認することが目的。
+
+「🎯 今日のおすすめ」と「🎯 イン逃げ狙い目レース分析」は、
+1号艇のイン逃げ率・2号艇の逃し率という簡易な統計に基づく実験的機能。
+データ量が少ないうちはサンプル数が少なく参考にならない点に注意。
 
 使い方:
     streamlit run dashboard.py
 """
 
 import sqlite3
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 
 DB_PATH = Path(__file__).parent / "data" / "boatrace.db"
+JST = ZoneInfo("Asia/Tokyo")
+
+SAMPLE_SIZE_WARNING_THRESHOLD = 5
+INN_NIGE_RATE_THRESHOLD = 0.8
+NIGASHI_RATE_THRESHOLD = 0.5
 
 st.set_page_config(page_title="BOATRACE データ確認ダッシュボード", layout="wide")
 
@@ -34,10 +45,124 @@ def format_yen(v):
     return f"¥{int(v):,}"
 
 
+def fmt_date(d):
+    return f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
+
+
+def compute_racer_rate_stats(entries_all, results_all):
+    """全期間のentries/resultsから、選手(登番)ごとの
+    ①1号艇イン逃げ率、②2号艇逃し率を計算する。
+    戻り値: (c1_stats, c2_stats, waku1_rank)"""
+    c1 = entries_all[entries_all["waku"] == 1].merge(
+        results_all[results_all["waku"] == 1][["race_date", "jcd", "rno", "rank"]],
+        on=["race_date", "jcd", "rno"], how="inner",
+    )
+    c1_stats = c1.groupby("toban").agg(starts=("rank", "size"), wins=("rank", lambda s: (s == "1").sum()))
+    c1_stats["rate"] = c1_stats["wins"] / c1_stats["starts"]
+
+    waku1_rank = results_all[results_all["waku"] == 1][["race_date", "jcd", "rno", "rank"]].rename(
+        columns={"rank": "waku1_rank"}
+    )
+    c2 = entries_all[entries_all["waku"] == 2].merge(
+        waku1_rank, on=["race_date", "jcd", "rno"], how="inner",
+    )
+    c2_stats = c2.groupby("toban").agg(
+        starts=("waku1_rank", "size"), nigasare=("waku1_rank", lambda s: (s == "1").sum())
+    )
+    c2_stats["rate"] = c2_stats["nigasare"] / c2_stats["starts"]
+
+    return c1_stats, c2_stats, waku1_rank
+
+
+def rate_label(stats_df, toban):
+    row = stats_df.loc[toban]
+    starts = int(row["starts"])
+    label = f"{row['rate'] * 100:.1f}% (n={starts})"
+    if starts < SAMPLE_SIZE_WARNING_THRESHOLD:
+        label += " ⚠️参考データ不足"
+    return label
+
+
+def find_qualifying_races(entries_df, c1_stats, c2_stats):
+    """①1号艇イン逃げ率・②2号艇逃し率の両条件を満たすレース(1号艇・2号艇の
+    出走表ペア)を抽出する。entries_dfは対象を絞ったentries(例: 当日分のみ、
+    または全期間)を渡す。"""
+    qualified_toban1 = set(c1_stats[c1_stats["rate"] >= INN_NIGE_RATE_THRESHOLD].index)
+    qualified_toban2 = set(c2_stats[c2_stats["rate"] >= NIGASHI_RATE_THRESHOLD].index)
+
+    entries1 = entries_df[entries_df["waku"] == 1][
+        ["race_date", "jcd", "rno", "toban", "racer_name", "venue_name"]
+    ].rename(columns={"toban": "toban1", "racer_name": "racer1_name"})
+    entries2 = entries_df[entries_df["waku"] == 2][
+        ["race_date", "jcd", "rno", "toban", "racer_name"]
+    ].rename(columns={"toban": "toban2", "racer_name": "racer2_name"})
+    race_pairs = entries1.merge(entries2, on=["race_date", "jcd", "rno"], how="inner")
+
+    return race_pairs[
+        race_pairs["toban1"].isin(qualified_toban1) & race_pairs["toban2"].isin(qualified_toban2)
+    ].copy()
+
+
+def add_rate_labels(candidates, c1_stats, c2_stats):
+    candidates = candidates.copy()
+    candidates["1号艇イン逃げ率"] = candidates["toban1"].apply(lambda t: rate_label(c1_stats, t))
+    candidates["2号艇逃し率"] = candidates["toban2"].apply(lambda t: rate_label(c2_stats, t))
+    return candidates
+
+
 st.title("🚤 BOATRACE データ確認ダッシュボード")
 st.caption("取得済みデータの中身をレース単位で目視確認するための簡易ツールです。")
 
 conn = get_connection()
+
+entries_all = load_df("SELECT race_date, jcd, rno, waku, toban, racer_name, venue_name FROM entries")
+results_all = load_df("SELECT race_date, jcd, rno, waku, rank FROM results")
+
+if not entries_all.empty and not results_all.empty:
+    c1_stats, c2_stats, waku1_rank = compute_racer_rate_stats(entries_all, results_all)
+else:
+    c1_stats = c2_stats = waku1_rank = None
+
+# ---------------------------------------------------------------------------
+# 🎯 今日のおすすめ
+#
+# 当日の出走表(まだ結果が出ていないレース)について、1号艇・2号艇の選手を
+# これまでの実績(過去のentries/results全体)と照らし合わせ、
+# ①1号艇イン逃げ率80%以上 かつ ②2号艇逃し率50%以上 を満たすレースを表示する。
+# 当日の出走表データは、GitHub Actionsの日次ジョブが
+# `--when today --entries-only` で毎朝取得する(結果はまだ存在しないため
+# 取得しない)。
+# ---------------------------------------------------------------------------
+st.header("🎯 今日のおすすめ")
+
+today_str = datetime.now(JST).strftime("%Y%m%d")
+today_entries = entries_all[entries_all["race_date"] == today_str] if not entries_all.empty else entries_all
+
+if today_entries.empty:
+    st.info(
+        f"{fmt_date(today_str)} の出走表データがまだありません。"
+        "日次ジョブの実行後、または手動で "
+        "`python boatrace_scraper.py --when today --entries-only` を実行すると表示されます。"
+    )
+elif c1_stats is None or c1_stats.empty or c2_stats.empty:
+    st.info("判定に使う過去の実績データがまだ十分にありません。")
+else:
+    today_candidates = find_qualifying_races(today_entries, c1_stats, c2_stats)
+    if today_candidates.empty:
+        st.info("本日は条件に合うレースがありません。")
+    else:
+        today_candidates = add_rate_labels(today_candidates, c1_stats, c2_stats)
+        display_df = today_candidates.rename(
+            columns={"venue_name": "場", "rno": "R", "racer1_name": "1号艇選手", "racer2_name": "2号艇選手"}
+        )[["場", "R", "1号艇選手", "1号艇イン逃げ率", "2号艇選手", "2号艇逃し率"]]
+        st.dataframe(display_df, hide_index=True, use_container_width=True)
+        st.caption(
+            "①1号艇イン逃げ率80%以上 かつ ②2号艇逃し率50%以上 の条件に合致したレースです。"
+            "サンプル数(n)が少ない選手は参考データ不足である旨を併記しています。"
+            "レース前の情報に基づく参考表示であり、結果を保証するものではありません。"
+        )
+
+st.divider()
 
 # ---------------------------------------------------------------------------
 # 日付選択
@@ -47,9 +172,6 @@ dates = load_df("SELECT DISTINCT race_date FROM races ORDER BY race_date DESC")[
 if not dates:
     st.warning("データがまだありません。boatrace_scraper.py を実行してデータを取得してください。")
     st.stop()
-
-def fmt_date(d):
-    return f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
 
 st.sidebar.header("レース選択")
 selected_date = st.sidebar.selectbox("日付", dates, format_func=fmt_date)
@@ -162,12 +284,12 @@ with tab_payouts:
 st.divider()
 
 # ---------------------------------------------------------------------------
-# イン逃げ狙い目レース分析(実験的機能)
+# イン逃げ狙い目レース分析(実験的機能・全期間)
 #
-# ①1号艇選手の「1コース走行時の1着率(イン逃げ率)」が80%以上、かつ
-# ②2号艇選手の「2コース走行時に1号艇へ1着を譲った率(逃し率)」が50%以上、
-# の両方を満たすレースを全期間のデータから抽出し、実際に1号艇が逃げた
-# 場合の2連単の出現頻度上位3つを集計する。
+# 「🎯 今日のおすすめ」と同じ条件・同じ選手統計(c1_stats/c2_stats)を使い、
+# 対象を「当日のみ」ではなく「全期間の全レース」に広げて集計する。
+# 条件に合致したレースのうち、実際に1号艇が逃げた場合の2連単の
+# 出現頻度上位3つを表示する。
 #
 # データ量が少ないうちは該当レースが0件になったり、少数のレースだけで
 # 統計を語ることになるのは想定通り。ここでは仕組みが正しく動くことの
@@ -181,66 +303,17 @@ st.caption(
     "実際に1号艇が逃げた場合の2連単の上位3つを集計します。"
 )
 
-SAMPLE_SIZE_WARNING_THRESHOLD = 5
-INN_NIGE_RATE_THRESHOLD = 0.8
-NIGASHI_RATE_THRESHOLD = 0.5
-
-entries_all = load_df("SELECT race_date, jcd, rno, waku, toban, racer_name, venue_name FROM entries")
-results_all = load_df("SELECT race_date, jcd, rno, waku, rank FROM results")
-
-if entries_all.empty or results_all.empty:
+if c1_stats is None:
     st.info("分析に必要なデータがまだありません。")
 else:
-    # 1号艇: 1コース走行時の1着率
-    c1 = entries_all[entries_all["waku"] == 1].merge(
-        results_all[results_all["waku"] == 1][["race_date", "jcd", "rno", "rank"]],
-        on=["race_date", "jcd", "rno"], how="inner",
-    )
-    c1_stats = c1.groupby("toban").agg(starts=("rank", "size"), wins=("rank", lambda s: (s == "1").sum()))
-    c1_stats["rate"] = c1_stats["wins"] / c1_stats["starts"]
-
-    # 2号艇: 2コース走行時に1号艇へ1着を譲った(逃した)率
-    waku1_rank = results_all[results_all["waku"] == 1][["race_date", "jcd", "rno", "rank"]].rename(
-        columns={"rank": "waku1_rank"}
-    )
-    c2 = entries_all[entries_all["waku"] == 2].merge(
-        waku1_rank, on=["race_date", "jcd", "rno"], how="inner",
-    )
-    c2_stats = c2.groupby("toban").agg(
-        starts=("waku1_rank", "size"), nigasare=("waku1_rank", lambda s: (s == "1").sum())
-    )
-    c2_stats["rate"] = c2_stats["nigasare"] / c2_stats["starts"]
-
-    qualified_toban1 = set(c1_stats[c1_stats["rate"] >= INN_NIGE_RATE_THRESHOLD].index)
-    qualified_toban2 = set(c2_stats[c2_stats["rate"] >= NIGASHI_RATE_THRESHOLD].index)
-
-    def rate_label(stats_df, toban):
-        row = stats_df.loc[toban]
-        starts = int(row["starts"])
-        label = f"{row['rate'] * 100:.1f}% (n={starts})"
-        if starts < SAMPLE_SIZE_WARNING_THRESHOLD:
-            label += " ⚠️参考データ不足"
-        return label
-
-    entries1 = entries_all[entries_all["waku"] == 1][
-        ["race_date", "jcd", "rno", "toban", "racer_name", "venue_name"]
-    ].rename(columns={"toban": "toban1", "racer_name": "racer1_name"})
-    entries2 = entries_all[entries_all["waku"] == 2][
-        ["race_date", "jcd", "rno", "toban", "racer_name"]
-    ].rename(columns={"toban": "toban2", "racer_name": "racer2_name"})
-    race_pairs = entries1.merge(entries2, on=["race_date", "jcd", "rno"], how="inner")
-
-    candidates = race_pairs[
-        race_pairs["toban1"].isin(qualified_toban1) & race_pairs["toban2"].isin(qualified_toban2)
-    ].copy()
+    candidates = find_qualifying_races(entries_all, c1_stats, c2_stats)
 
     st.subheader(f"条件に合致したレース: {len(candidates)}件")
     if candidates.empty:
         st.info("条件(①イン逃げ率80%以上 かつ ②2コース逃し率50%以上)に合致するレースは見つかりませんでした。")
     else:
+        candidates = add_rate_labels(candidates, c1_stats, c2_stats)
         candidates["日付"] = candidates["race_date"].apply(fmt_date)
-        candidates["1号艇イン逃げ率"] = candidates["toban1"].apply(lambda t: rate_label(c1_stats, t))
-        candidates["2号艇逃し率"] = candidates["toban2"].apply(lambda t: rate_label(c2_stats, t))
         display_df = candidates.rename(
             columns={"venue_name": "場", "rno": "R", "racer1_name": "1号艇選手", "racer2_name": "2号艇選手"}
         )[["日付", "場", "R", "1号艇選手", "1号艇イン逃げ率", "2号艇選手", "2号艇逃し率"]]
