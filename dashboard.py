@@ -160,4 +160,118 @@ with tab_payouts:
         st.dataframe(payouts_df, hide_index=True, use_container_width=True)
 
 st.divider()
+
+# ---------------------------------------------------------------------------
+# イン逃げ狙い目レース分析(実験的機能)
+#
+# ①1号艇選手の「1コース走行時の1着率(イン逃げ率)」が80%以上、かつ
+# ②2号艇選手の「2コース走行時に1号艇へ1着を譲った率(逃し率)」が50%以上、
+# の両方を満たすレースを全期間のデータから抽出し、実際に1号艇が逃げた
+# 場合の2連単の出現頻度上位3つを集計する。
+#
+# データ量が少ないうちは該当レースが0件になったり、少数のレースだけで
+# 統計を語ることになるのは想定通り。ここでは仕組みが正しく動くことの
+# 確認を目的とする。
+# ---------------------------------------------------------------------------
+st.header("🎯 イン逃げ狙い目レース分析(実験的機能)")
+st.caption(
+    "①1号艇選手のイン逃げ率(1コース走行時の1着率)が80%以上、"
+    "②2号艇選手の逃し率(2コース走行時に1号艇へ1着を譲った率)が50%以上、"
+    "の両方を満たすレースを全期間のデータから抽出し、"
+    "実際に1号艇が逃げた場合の2連単の上位3つを集計します。"
+)
+
+SAMPLE_SIZE_WARNING_THRESHOLD = 5
+INN_NIGE_RATE_THRESHOLD = 0.8
+NIGASHI_RATE_THRESHOLD = 0.5
+
+entries_all = load_df("SELECT race_date, jcd, rno, waku, toban, racer_name, venue_name FROM entries")
+results_all = load_df("SELECT race_date, jcd, rno, waku, rank FROM results")
+
+if entries_all.empty or results_all.empty:
+    st.info("分析に必要なデータがまだありません。")
+else:
+    # 1号艇: 1コース走行時の1着率
+    c1 = entries_all[entries_all["waku"] == 1].merge(
+        results_all[results_all["waku"] == 1][["race_date", "jcd", "rno", "rank"]],
+        on=["race_date", "jcd", "rno"], how="inner",
+    )
+    c1_stats = c1.groupby("toban").agg(starts=("rank", "size"), wins=("rank", lambda s: (s == "1").sum()))
+    c1_stats["rate"] = c1_stats["wins"] / c1_stats["starts"]
+
+    # 2号艇: 2コース走行時に1号艇へ1着を譲った(逃した)率
+    waku1_rank = results_all[results_all["waku"] == 1][["race_date", "jcd", "rno", "rank"]].rename(
+        columns={"rank": "waku1_rank"}
+    )
+    c2 = entries_all[entries_all["waku"] == 2].merge(
+        waku1_rank, on=["race_date", "jcd", "rno"], how="inner",
+    )
+    c2_stats = c2.groupby("toban").agg(
+        starts=("waku1_rank", "size"), nigasare=("waku1_rank", lambda s: (s == "1").sum())
+    )
+    c2_stats["rate"] = c2_stats["nigasare"] / c2_stats["starts"]
+
+    qualified_toban1 = set(c1_stats[c1_stats["rate"] >= INN_NIGE_RATE_THRESHOLD].index)
+    qualified_toban2 = set(c2_stats[c2_stats["rate"] >= NIGASHI_RATE_THRESHOLD].index)
+
+    def rate_label(stats_df, toban):
+        row = stats_df.loc[toban]
+        starts = int(row["starts"])
+        label = f"{row['rate'] * 100:.1f}% (n={starts})"
+        if starts < SAMPLE_SIZE_WARNING_THRESHOLD:
+            label += " ⚠️参考データ不足"
+        return label
+
+    entries1 = entries_all[entries_all["waku"] == 1][
+        ["race_date", "jcd", "rno", "toban", "racer_name", "venue_name"]
+    ].rename(columns={"toban": "toban1", "racer_name": "racer1_name"})
+    entries2 = entries_all[entries_all["waku"] == 2][
+        ["race_date", "jcd", "rno", "toban", "racer_name"]
+    ].rename(columns={"toban": "toban2", "racer_name": "racer2_name"})
+    race_pairs = entries1.merge(entries2, on=["race_date", "jcd", "rno"], how="inner")
+
+    candidates = race_pairs[
+        race_pairs["toban1"].isin(qualified_toban1) & race_pairs["toban2"].isin(qualified_toban2)
+    ].copy()
+
+    st.subheader(f"条件に合致したレース: {len(candidates)}件")
+    if candidates.empty:
+        st.info("条件(①イン逃げ率80%以上 かつ ②2コース逃し率50%以上)に合致するレースは見つかりませんでした。")
+    else:
+        candidates["日付"] = candidates["race_date"].apply(fmt_date)
+        candidates["1号艇イン逃げ率"] = candidates["toban1"].apply(lambda t: rate_label(c1_stats, t))
+        candidates["2号艇逃し率"] = candidates["toban2"].apply(lambda t: rate_label(c2_stats, t))
+        display_df = candidates.rename(
+            columns={"venue_name": "場", "rno": "R", "racer1_name": "1号艇選手", "racer2_name": "2号艇選手"}
+        )[["日付", "場", "R", "1号艇選手", "1号艇イン逃げ率", "2号艇選手", "2号艇逃し率"]]
+        st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+    st.subheader("③ 実際に1号艇が逃げた場合の2連単 上位3")
+    if candidates.empty:
+        st.info("条件に合致するレースがないため、集計対象がありません。")
+    else:
+        cand_with_result = candidates.merge(waku1_rank, on=["race_date", "jcd", "rno"], how="left")
+        escaped = cand_with_result[cand_with_result["waku1_rank"] == "1"]
+        rank2 = results_all[results_all["rank"] == "2"][["race_date", "jcd", "rno", "waku"]].rename(
+            columns={"waku": "waku_2nd"}
+        )
+        escaped = escaped.merge(rank2, on=["race_date", "jcd", "rno"], how="inner")
+
+        total_escaped = len(escaped)
+        st.write(
+            f"条件に合致したレース{len(candidates)}件のうち、"
+            f"実際に1号艇が1着だった件数(2着艇の結果も判明済み): {total_escaped}件"
+        )
+        if total_escaped < SAMPLE_SIZE_WARNING_THRESHOLD:
+            st.warning("⚠️ サンプル数が少なく、参考データ不足です。")
+
+        if total_escaped == 0:
+            st.info("該当レースで実際に1号艇が逃げた事例がまだありません。")
+        else:
+            escaped["combo"] = "1-" + escaped["waku_2nd"].astype(int).astype(str)
+            top3 = escaped["combo"].value_counts().head(3)
+            for combo, cnt in top3.items():
+                st.write(f"- **{combo}**: {cnt}回 (n={total_escaped}中)")
+
+st.divider()
 st.caption(f"DB: {DB_PATH}")
