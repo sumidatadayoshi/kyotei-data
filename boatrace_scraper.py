@@ -524,6 +524,7 @@ CREATE TABLE IF NOT EXISTS results (
     rno INTEGER NOT NULL,
     waku INTEGER NOT NULL,
     rank TEXT,
+    is_start_trouble INTEGER,
     toban TEXT,
     racer_name TEXT,
     race_time TEXT,
@@ -567,6 +568,7 @@ CREATE TABLE IF NOT EXISTS female_racers (
 SCHEMA_MIGRATIONS = [
     ("races", "grade", "TEXT"),
     ("entries", "gender", "TEXT"),
+    ("results", "is_start_trouble", "INTEGER"),
 ]
 
 
@@ -578,6 +580,13 @@ def get_connection(db_path):
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    # is_start_trouble はrankから機械的に導出できるため、既存行(NULL)は
+    # 再取得せずその場で補完する。F(フライング)とL(出遅れ)を同一の
+    # 「スタート事故」として1にまとめる。
+    conn.execute(
+        "UPDATE results SET is_start_trouble = CASE WHEN rank IN ('F', 'L') THEN 1 ELSE 0 END "
+        "WHERE is_start_trouble IS NULL"
+    )
     conn.commit()
     return conn
 
@@ -629,12 +638,14 @@ def save_results(conn, race_date, jcd, venue_name, rno, results, fetched_at):
     for r in results:
         if r["waku"] is None:
             continue
+        is_start_trouble = 1 if r["rank"] in ("F", "L") else 0
         conn.execute(
             """INSERT OR REPLACE INTO results
-            (race_date, jcd, venue_name, rno, waku, rank, toban, racer_name, race_time, start_timing, fetched_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (race_date, jcd, venue_name, rno, r["waku"], r["rank"], r["toban"], r["racer_name"],
-             r["race_time"], r["start_timing"], fetched_at),
+            (race_date, jcd, venue_name, rno, waku, rank, is_start_trouble, toban, racer_name,
+             race_time, start_timing, fetched_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (race_date, jcd, venue_name, rno, r["waku"], r["rank"], is_start_trouble, r["toban"],
+             r["racer_name"], r["race_time"], r["start_timing"], fetched_at),
         )
 
 
