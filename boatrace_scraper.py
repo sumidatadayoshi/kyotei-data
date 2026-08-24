@@ -55,6 +55,10 @@ JCD_NAMES = {
 
 MAX_RACES_PER_VENUE = 12
 
+# 対象日が「終了しているはずの日」の場合に、結果取得率がこれを下回ると
+# scrape_logのstatusを'partial'にし、mainの終了コードを1にする。
+RESULTS_COMPLETENESS_THRESHOLD = 0.9
+
 logger = logging.getLogger("boatrace_scraper")
 
 
@@ -608,16 +612,48 @@ def scrape_day(date_str, db_path, interval_sec=1.5):
                 jcd, rno, len(entries), len(results), len(payouts),
             )
 
+    # 結果データの完全性チェック。
+    # 対象日がJST基準で「昨日以前」(=レースが終わっているはずの日)なのに
+    # resultsが著しく欠けている場合は、日付境界の取り違えやスクレイピング失敗を疑う。
+    # (例: cronの実行がJST 0時をまたぎ、まだ1レースも終わっていない翌日分を
+    #  取得してしまうケース。この場合HTTPエラーは出ないため、exit code 0のまま
+    #  見過ごされてしまう。)
+    races_total = conn.execute(
+        "SELECT COUNT(*) FROM races WHERE race_date = ?", (date_str,)
+    ).fetchone()[0]
+    results_races = conn.execute(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT jcd, rno FROM results WHERE race_date = ?)",
+        (date_str,),
+    ).fetchone()[0]
+    completeness = (results_races / races_total) if races_total else 1.0
+    today_jst = datetime.now(JST).strftime("%Y%m%d")
+    expect_complete = date_str < today_jst
+
+    status = "ok"
+    if expect_complete and races_total > 0 and completeness < RESULTS_COMPLETENESS_THRESHOLD:
+        status = "partial"
+        logger.error(
+            "結果データが不足しています: %d/%d レース (%.1f%%) が結果取得済み。"
+            "対象日(%s)は既に終了しているはずの日ですが、閾値(%.0f%%)を下回っています。"
+            "日付境界の取り違えやサイト側の変更、スクレイピング失敗の可能性があります。",
+            results_races, races_total, completeness * 100, date_str,
+            RESULTS_COMPLETENESS_THRESHOLD * 100,
+        )
+    else:
+        logger.info(
+            "結果取得率: %d/%d レース (%.1f%%)", results_races, races_total, completeness * 100
+        )
+
     finished_at = datetime.now().isoformat(timespec="seconds")
     conn.execute(
         "INSERT OR REPLACE INTO scrape_log (race_date, started_at, finished_at, venues_count, races_count, status) "
         "VALUES (?,?,?,?,?,?)",
-        (date_str, started_at, finished_at, len(venues), races_count, "ok"),
+        (date_str, started_at, finished_at, len(venues), races_count, status),
     )
     conn.commit()
     conn.close()
-    logger.info("完了: %s (会場数=%d, レース数=%d)", date_str, len(venues), races_count)
-    return len(venues), races_count
+    logger.info("完了: %s (会場数=%d, レース数=%d, status=%s)", date_str, len(venues), races_count, status)
+    return len(venues), races_count, status
 
 
 def main():
@@ -649,7 +685,10 @@ def main():
     )
 
     logger.info("BOATRACEデータ取得開始: date=%s db=%s interval=%.1fs", date_str, args.db, args.interval)
-    scrape_day(date_str, args.db, interval_sec=args.interval)
+    _, _, status = scrape_day(date_str, args.db, interval_sec=args.interval)
+    if status != "ok":
+        logger.error("データが不完全なまま終了しました (status=%s)。終了コード1で終了します。", status)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

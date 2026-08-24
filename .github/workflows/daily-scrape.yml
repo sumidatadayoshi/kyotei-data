@@ -2,8 +2,14 @@ name: Daily Boatrace Scrape
 
 on:
   schedule:
-    # 毎日 UTC 14:30 = 日本時間(JST, UTC+9) 23:30
-    - cron: "30 14 * * *"
+    # 毎日 UTC 21:00 = 日本時間(JST, UTC+9) 翌6:00。
+    # 旧スケジュール(JST 23:30に「today」を取得)はGitHub Actionsの
+    # スケジュール実行遅延でJST 0時をまたぐことがあり、その場合
+    # 「まだ1レースも終わっていない翌日」の出走表だけを取得して
+    # resultsが0件のまま終わってしまう不具合があった。
+    # 前日のレースが確実に終わっている翌朝に「yesterday」を取得することで、
+    # 日付境界のタイミング問題を構造的に回避する。
+    - cron: "0 21 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -29,10 +35,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run scraper (today, JST基準)
-        run: python boatrace_scraper.py --when today --interval 1.5
+      - name: Run scraper (yesterday, JST基準)
+        run: python boatrace_scraper.py --when yesterday --interval 1.5
 
       - name: Commit and push data changes
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
