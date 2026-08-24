@@ -402,13 +402,15 @@ else:
                 total_return = int(hits["payout"].sum())
                 total_stake = total_races * BET_AMOUNT
                 recovery_rate = (total_return / total_stake * 100) if total_stake > 0 else 0.0
+                hit_rate = (hit_count / total_races * 100) if total_races > 0 else 0.0
 
                 st.write(f"買い目(固定): **2連単 {best_combo}**(過去に1号艇が逃げた際の最頻出目)")
 
-                m1, m2, m3 = st.columns(3)
+                m1, m2, m3, m4 = st.columns(4)
                 m1.metric("対象レース数(母数)", f"{total_races}件")
                 m2.metric("的中回数", f"{hit_count}回")
-                m3.metric("回収率", f"{recovery_rate:.1f}%")
+                m3.metric("的中率", f"{hit_rate:.1f}%")
+                m4.metric("回収率", f"{recovery_rate:.1f}%")
 
                 st.caption(
                     f"賭け金合計: {BET_AMOUNT}円 × {total_races}件 = {total_stake:,}円 / "
