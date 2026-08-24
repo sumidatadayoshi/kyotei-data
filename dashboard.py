@@ -347,4 +347,76 @@ else:
                 st.write(f"- **{combo}**: {cnt}回 (n={total_escaped}中)")
 
 st.divider()
+
+# ---------------------------------------------------------------------------
+# 💰 回収率シミュレーター(実験的機能)
+#
+# 「イン逃げ狙い目レース分析」で条件(①②)に合致した過去レースのうち、
+# 実際に1号艇が逃げた場合に最も出現頻度が高かった2連単の目を「毎回同じ
+# 買い方」として固定し、条件に合致し結果が判明している全レースに
+# 100円ずつ賭けていたと仮定した場合の回収率を計算する。
+#
+# 回収率 = 的中時の払戻金合計 ÷ 賭け金合計(100円 × 対象レース数)
+#
+# データ量が少ないうちは母数が少なく参考にならないのは想定通り。
+# ここでは仕組みが正しく動くことの確認を目的とする。
+# ---------------------------------------------------------------------------
+st.header("💰 回収率シミュレーター(実験的機能)")
+st.caption(
+    "①②の条件に合致した過去レースのうち、実際に1号艇が逃げた場合の2連単で"
+    "最も出現頻度が高かった目を「毎回同じ買い方」として固定し、"
+    "条件に合致し結果が判明している対象レース全てに100円ずつ賭けていたと"
+    "仮定した場合の回収率を計算します。"
+)
+
+BET_AMOUNT = 100
+
+if c1_stats is None:
+    st.info("分析に必要なデータがまだありません。")
+else:
+    sim_candidates = find_qualifying_races(entries_all, c1_stats, c2_stats)
+
+    if sim_candidates.empty:
+        st.info("条件に合致するレースがないため、シミュレーションできません。")
+    else:
+        payouts_2tan = load_df(
+            "SELECT race_date, jcd, rno, combination, payout FROM payouts WHERE bet_type = '2連単'"
+        )
+        concluded = sim_candidates.merge(payouts_2tan, on=["race_date", "jcd", "rno"], how="inner")
+
+        if concluded.empty:
+            st.info("条件に合致したレースの中に、結果が判明しているものがまだありません。")
+        else:
+            escaped_combos = concluded[concluded["combination"].str.startswith("1-")]
+            if escaped_combos.empty:
+                st.info(
+                    "条件に合致し結果が判明したレースで、実際に1号艇が逃げた事例が"
+                    "まだないため、賭け目を決定できません。"
+                )
+            else:
+                best_combo = escaped_combos["combination"].value_counts().index[0]
+
+                total_races = len(concluded)
+                hits = concluded[concluded["combination"] == best_combo]
+                hit_count = len(hits)
+                total_return = int(hits["payout"].sum())
+                total_stake = total_races * BET_AMOUNT
+                recovery_rate = (total_return / total_stake * 100) if total_stake > 0 else 0.0
+
+                st.write(f"買い目(固定): **2連単 {best_combo}**(過去に1号艇が逃げた際の最頻出目)")
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("対象レース数(母数)", f"{total_races}件")
+                m2.metric("的中回数", f"{hit_count}回")
+                m3.metric("回収率", f"{recovery_rate:.1f}%")
+
+                st.caption(
+                    f"賭け金合計: {BET_AMOUNT}円 × {total_races}件 = {total_stake:,}円 / "
+                    f"払戻金合計(的中分): {total_return:,}円"
+                )
+
+                if total_races < SAMPLE_SIZE_WARNING_THRESHOLD:
+                    st.warning("⚠️ 対象レース数(母数)が少なく、参考データ不足です。")
+
+st.divider()
 st.caption(f"DB: {DB_PATH}")
