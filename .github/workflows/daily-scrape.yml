@@ -2,14 +2,16 @@ name: Daily Boatrace Scrape
 
 on:
   schedule:
-    # 毎日 UTC 21:00 = 日本時間(JST, UTC+9) 翌6:00。
+    # 毎日 UTC 19:00 = 日本時間(JST, UTC+9) 翌4:00。
     # 旧スケジュール(JST 23:30に「today」を取得)はGitHub Actionsの
     # スケジュール実行遅延でJST 0時をまたぐことがあり、その場合
     # 「まだ1レースも終わっていない翌日」の出走表だけを取得して
     # resultsが0件のまま終わってしまう不具合があった。
     # 前日のレースが確実に終わっている翌朝に「yesterday」を取得することで、
     # 日付境界のタイミング問題を構造的に回避する。
-    - cron: "0 21 * * *"
+    # (ナイターを含む全場の最終レースは遅くとも21時台には終了するため、
+    # 翌4:00時点でも前日のレース結果は確実に取得可能)
+    - cron: "0 19 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -46,7 +48,7 @@ jobs:
         run: python boatrace_scraper.py --when yesterday --interval 1.5
 
       - name: Run scraper (today's racelist only, JST基準)
-        # 出走表は前日17〜22時頃までに各場で公開されるため、JST 6:00の
+        # 出走表は前日17〜22時頃までに各場で公開されるため、JST 4:00の
         # 実行時点では当日分の出走表は既に取得可能。結果はまだ出ていない
         # ため取得しない(「今日のおすすめ」機能向け)。
         # 前段のステップが失敗していても、当日分の出走表取得は独立して試みる。
