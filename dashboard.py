@@ -123,6 +123,16 @@ def classify_composition(genders):
     return "混合戦"
 
 
+TODAY_GRADE_CHOICES = ["すべてのグレード", "SG・G1", "その他(G2・G3・一般戦)"]
+
+
+def grade_bucket(grade):
+    """「今日のおすすめ」のグレード絞り込み用に、gradeを3分類のどれかに丸める。"""
+    if grade in ("SG", "G1"):
+        return "SG・G1"
+    return "その他(G2・G3・一般戦)"
+
+
 st.title("🚤 BOATRACE データ確認ダッシュボード")
 st.caption("取得済みデータの中身をレース単位で目視確認するための簡易ツールです。")
 
@@ -174,7 +184,18 @@ if today_entries.empty:
 elif c1_stats is None or c1_stats.empty or c2_stats.empty:
     st.info("判定に使う過去の実績データがまだ十分にありません。")
 else:
-    today_candidates = find_qualifying_races(today_entries, c1_stats, c2_stats)
+    today_grade_choice = st.radio(
+        "グレードで絞り込み", TODAY_GRADE_CHOICES, horizontal=True, key="today_grade_filter",
+    )
+    today_race_keys = race_meta[race_meta["race_date"] == today_str][["race_date", "jcd", "rno", "grade"]].copy()
+    today_race_keys["bucket"] = today_race_keys["grade"].apply(grade_bucket)
+    if today_grade_choice != "すべてのグレード":
+        today_race_keys = today_race_keys[today_race_keys["bucket"] == today_grade_choice]
+    today_entries_filtered = today_entries.merge(
+        today_race_keys[["race_date", "jcd", "rno"]], on=["race_date", "jcd", "rno"], how="inner"
+    )
+
+    today_candidates = find_qualifying_races(today_entries_filtered, c1_stats, c2_stats)
     if today_candidates.empty:
         st.info("本日は条件に合うレースがありません。")
     else:
