@@ -419,18 +419,50 @@ else:
         )[["日付", "場", "R", "グレード", "性別構成", "1号艇選手", "1号艇イン逃げ率", "2号艇選手", "2号艇逃し率"]]
         st.dataframe(display_df, hide_index=True, use_container_width=True)
 
+    if candidates.empty:
+        cand_with_result = candidates
+        known_result = candidates
+        escaped = candidates
+    else:
+        cand_with_result = candidates.merge(waku1_rank, on=["race_date", "jcd", "rno"], how="left")
+        known_result = cand_with_result[cand_with_result["waku1_rank"].notna()]
+        escaped = known_result[known_result["waku1_rank"] == "1"]
+
+    st.subheader("① 実際に1号艇が逃げた割合(結果検証)")
+    st.caption(
+        "①②の条件(過去実績に基づく事前の予測)に合致したレースについて、"
+        "予測ではなく実際の結果として1号艇が1着(逃げ)だった割合です。"
+        "「予測がどれだけ当たっていたか」を検証するための表示です。"
+    )
+    if candidates.empty:
+        st.info("条件に合致するレースがないため、集計対象がありません。")
+    elif known_result.empty:
+        st.info("条件に合致したレースの中に、結果が判明しているものがまだありません。")
+    else:
+        total_known = len(known_result)
+        escape_count = len(escaped)
+        escape_rate = (escape_count / total_known * 100) if total_known > 0 else 0.0
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("対象レース数", f"{total_known}件")
+        m2.metric("実際に逃げた回数", f"{escape_count}回")
+        m3.metric("実際の逃げ率", f"{escape_rate:.1f}%")
+
+        if total_known < SAMPLE_SIZE_WARNING_THRESHOLD:
+            st.warning("⚠️ 対象レース数が少なく、参考データ不足です。")
+
     st.subheader("③ 実際に1号艇が逃げた場合の2連単 上位3")
     if candidates.empty:
         st.info("条件に合致するレースがないため、集計対象がありません。")
+    elif escaped.empty:
+        st.info("該当レースで実際に1号艇が逃げた事例がまだありません。")
     else:
-        cand_with_result = candidates.merge(waku1_rank, on=["race_date", "jcd", "rno"], how="left")
-        escaped = cand_with_result[cand_with_result["waku1_rank"] == "1"]
         rank2 = results_all[results_all["rank"] == "2"][["race_date", "jcd", "rno", "waku"]].rename(
             columns={"waku": "waku_2nd"}
         )
-        escaped = escaped.merge(rank2, on=["race_date", "jcd", "rno"], how="inner")
+        escaped_with_2nd = escaped.merge(rank2, on=["race_date", "jcd", "rno"], how="inner")
 
-        total_escaped = len(escaped)
+        total_escaped = len(escaped_with_2nd)
         st.write(
             f"条件に合致したレース{len(candidates)}件のうち、"
             f"実際に1号艇が1着だった件数(2着艇の結果も判明済み): {total_escaped}件"
@@ -441,8 +473,8 @@ else:
         if total_escaped == 0:
             st.info("該当レースで実際に1号艇が逃げた事例がまだありません。")
         else:
-            escaped["combo"] = "1-" + escaped["waku_2nd"].astype(int).astype(str)
-            top3 = escaped["combo"].value_counts().head(3)
+            escaped_with_2nd["combo"] = "1-" + escaped_with_2nd["waku_2nd"].astype(int).astype(str)
+            top3 = escaped_with_2nd["combo"].value_counts().head(3)
             for combo, cnt in top3.items():
                 st.write(f"- **{combo}**: {cnt}回 (n={total_escaped}中)")
 
@@ -519,6 +551,69 @@ else:
 
                 if total_races < SAMPLE_SIZE_WARNING_THRESHOLD:
                     st.warning("⚠️ 対象レース数(母数)が少なく、参考データ不足です。")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# 💰 「1-3・1-4」固定買い回収率シミュレーター(実験的機能)
+#
+# 既存の回収率シミュレーター(出現頻度が最も高い目を買う方式)とは別に、
+# ①②の条件に合致した対象レースすべてで、2連単「1-3」「1-4」を毎回固定で
+# 購入した場合(1レースあたり1-3に100円+1-4に100円=合計200円)の
+# 回収率を計算する。
+# ---------------------------------------------------------------------------
+st.header("💰「1-3・1-4」固定買い回収率シミュレーター(実験的機能)")
+st.caption(
+    "既存の回収率シミュレーターとは別に、①②の条件に合致した対象レースすべてで"
+    "「2連単 1-3」と「2連単 1-4」を毎回固定で購入した場合"
+    "(1レースあたり1-3に100円・1-4に100円の合計200円)の回収率を計算します。"
+)
+
+FIXED_BET_AMOUNT = 100
+FIXED_COMBOS = ["1-3", "1-4"]
+
+if c1_stats is None:
+    st.info("分析に必要なデータがまだありません。")
+else:
+    fixed_candidates = find_qualifying_races(entries_filtered, c1_stats, c2_stats)
+
+    if fixed_candidates.empty:
+        st.info("条件に合致するレースがないため、シミュレーションできません。")
+    else:
+        payouts_2tan_fixed = load_df(
+            "SELECT race_date, jcd, rno, combination, payout FROM payouts WHERE bet_type = '2連単'"
+        )
+        fixed_concluded = fixed_candidates.merge(
+            payouts_2tan_fixed, on=["race_date", "jcd", "rno"], how="inner"
+        )
+
+        if fixed_concluded.empty:
+            st.info("条件に合致したレースの中に、結果が判明しているものがまだありません。")
+        else:
+            total_races = len(fixed_concluded)
+            hits_13 = fixed_concluded[fixed_concluded["combination"] == "1-3"]
+            hits_14 = fixed_concluded[fixed_concluded["combination"] == "1-4"]
+            hit_count_13 = len(hits_13)
+            hit_count_14 = len(hits_14)
+            total_return = int(hits_13["payout"].sum() + hits_14["payout"].sum())
+            total_stake = total_races * FIXED_BET_AMOUNT * len(FIXED_COMBOS)
+            recovery_rate = (total_return / total_stake * 100) if total_stake > 0 else 0.0
+
+            st.write("買い目(固定): **2連単 1-3(100円) + 2連単 1-4(100円)** を毎回購入")
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("対象レース数(母数)", f"{total_races}件")
+            m2.metric("1-3 的中回数", f"{hit_count_13}回")
+            m3.metric("1-4 的中回数", f"{hit_count_14}回")
+            m4.metric("回収率", f"{recovery_rate:.1f}%")
+
+            st.caption(
+                f"賭け金合計: {FIXED_BET_AMOUNT}円 × 2点 × {total_races}件 = {total_stake:,}円 / "
+                f"払戻金合計(的中分): {total_return:,}円"
+            )
+
+            if total_races < SAMPLE_SIZE_WARNING_THRESHOLD:
+                st.warning("⚠️ 対象レース数(母数)が少なく、参考データ不足です。")
 
 st.divider()
 st.caption(f"DB: {DB_PATH}")
