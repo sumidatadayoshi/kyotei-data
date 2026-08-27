@@ -601,22 +601,24 @@ else:
             stake_14 = total_races * FIXED_BET_AMOUNT
             recovery_rate_13 = (return_13 / stake_13 * 100) if stake_13 > 0 else 0.0
             recovery_rate_14 = (return_14 / stake_14 * 100) if stake_14 > 0 else 0.0
+            hit_rate_13 = (hit_count_13 / total_races * 100) if total_races > 0 else 0.0
+            hit_rate_14 = (hit_count_14 / total_races * 100) if total_races > 0 else 0.0
 
             st.subheader("2連単 1-3 のみ買い続けた場合")
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("対象レース数", f"{total_races}件")
             m2.metric("的中回数", f"{hit_count_13}回")
-            m3.metric("賭け金合計", f"{stake_13:,}円")
+            m3.metric("的中率", f"{hit_rate_13:.1f}%")
             m4.metric("回収率", f"{recovery_rate_13:.1f}%")
-            st.caption(f"払戻金合計(的中分): {return_13:,}円")
+            st.caption(f"賭け金合計: {stake_13:,}円 / 払戻金合計(的中分): {return_13:,}円")
 
             st.subheader("2連単 1-4 のみ買い続けた場合")
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("対象レース数", f"{total_races}件")
             m2.metric("的中回数", f"{hit_count_14}回")
-            m3.metric("賭け金合計", f"{stake_14:,}円")
+            m3.metric("的中率", f"{hit_rate_14:.1f}%")
             m4.metric("回収率", f"{recovery_rate_14:.1f}%")
-            st.caption(f"払戻金合計(的中分): {return_14:,}円")
+            st.caption(f"賭け金合計: {stake_14:,}円 / 払戻金合計(的中分): {return_14:,}円")
 
             total_return = return_13 + return_14
             total_stake = stake_13 + stake_14
