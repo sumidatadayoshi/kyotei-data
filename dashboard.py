@@ -567,6 +567,7 @@ st.caption(
     "既存の回収率シミュレーターとは別に、①②の条件に合致した対象レースすべてで"
     "「2連単 1-3」または「2連単 1-4」を毎回固定で購入し続けた場合"
     "(1レースあたり100円)の回収率を、それぞれ個別に計算します。"
+    "あわせて「1-2・1-3・1-4」の3点買いを続けた場合の的中率・回収率も計算します。"
 )
 
 FIXED_BET_AMOUNT = 100
@@ -604,6 +605,14 @@ else:
             hit_rate_13 = (hit_count_13 / total_races * 100) if total_races > 0 else 0.0
             hit_rate_14 = (hit_count_14 / total_races * 100) if total_races > 0 else 0.0
 
+            triple_combos = ["1-2", "1-3", "1-4"]
+            hits_triple = fixed_concluded[fixed_concluded["combination"].isin(triple_combos)]
+            hit_count_triple = len(hits_triple)
+            return_triple = int(hits_triple["payout"].sum())
+            stake_triple = total_races * FIXED_BET_AMOUNT * len(triple_combos)
+            recovery_rate_triple = (return_triple / stake_triple * 100) if stake_triple > 0 else 0.0
+            hit_rate_triple = (hit_count_triple / total_races * 100) if total_races > 0 else 0.0
+
             st.subheader("2連単 1-3 のみ買い続けた場合")
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("対象レース数", f"{total_races}件")
@@ -619,6 +628,15 @@ else:
             m3.metric("的中率", f"{hit_rate_14:.1f}%")
             m4.metric("回収率", f"{recovery_rate_14:.1f}%")
             st.caption(f"賭け金合計: {stake_14:,}円 / 払戻金合計(的中分): {return_14:,}円")
+
+            st.subheader("2連単 1-2・1-3・1-4 の3点買いを続けた場合")
+            st.caption("3点(1-2・1-3・1-4)のうち、いずれか1点でも当たった割合・回収率です。")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("対象レース数", f"{total_races}件")
+            m2.metric("的中回数", f"{hit_count_triple}回")
+            m3.metric("的中率", f"{hit_rate_triple:.1f}%")
+            m4.metric("回収率", f"{recovery_rate_triple:.1f}%")
+            st.caption(f"賭け金合計: {stake_triple:,}円 / 払戻金合計(的中分): {return_triple:,}円")
 
             total_return = return_13 + return_14
             total_stake = stake_13 + stake_14
