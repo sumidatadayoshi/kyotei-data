@@ -558,15 +558,15 @@ st.divider()
 # 💰 「1-3・1-4」固定買い回収率シミュレーター(実験的機能)
 #
 # 既存の回収率シミュレーター(出現頻度が最も高い目を買う方式)とは別に、
-# ①②の条件に合致した対象レースすべてで、2連単「1-3」「1-4」を毎回固定で
-# 購入した場合(1レースあたり1-3に100円+1-4に100円=合計200円)の
-# 回収率を計算する。
+# ①②の条件に合致した対象レースすべてで、2連単「1-3」「1-4」をそれぞれ
+# 毎回固定で購入した場合(1レースあたり100円)の回収率を、1-3・1-4それぞれ
+# 個別に計算する。
 # ---------------------------------------------------------------------------
 st.header("💰「1-3・1-4」固定買い回収率シミュレーター(実験的機能)")
 st.caption(
     "既存の回収率シミュレーターとは別に、①②の条件に合致した対象レースすべてで"
-    "「2連単 1-3」と「2連単 1-4」を毎回固定で購入した場合"
-    "(1レースあたり1-3に100円・1-4に100円の合計200円)の回収率を計算します。"
+    "「2連単 1-3」または「2連単 1-4」を毎回固定で購入し続けた場合"
+    "(1レースあたり100円)の回収率を、それぞれ個別に計算します。"
 )
 
 FIXED_BET_AMOUNT = 100
@@ -595,21 +595,35 @@ else:
             hits_14 = fixed_concluded[fixed_concluded["combination"] == "1-4"]
             hit_count_13 = len(hits_13)
             hit_count_14 = len(hits_14)
-            total_return = int(hits_13["payout"].sum() + hits_14["payout"].sum())
-            total_stake = total_races * FIXED_BET_AMOUNT * len(FIXED_COMBOS)
-            recovery_rate = (total_return / total_stake * 100) if total_stake > 0 else 0.0
+            return_13 = int(hits_13["payout"].sum())
+            return_14 = int(hits_14["payout"].sum())
+            stake_13 = total_races * FIXED_BET_AMOUNT
+            stake_14 = total_races * FIXED_BET_AMOUNT
+            recovery_rate_13 = (return_13 / stake_13 * 100) if stake_13 > 0 else 0.0
+            recovery_rate_14 = (return_14 / stake_14 * 100) if stake_14 > 0 else 0.0
 
-            st.write("買い目(固定): **2連単 1-3(100円) + 2連単 1-4(100円)** を毎回購入")
-
+            st.subheader("2連単 1-3 のみ買い続けた場合")
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("対象レース数(母数)", f"{total_races}件")
-            m2.metric("1-3 的中回数", f"{hit_count_13}回")
-            m3.metric("1-4 的中回数", f"{hit_count_14}回")
-            m4.metric("回収率", f"{recovery_rate:.1f}%")
+            m1.metric("対象レース数", f"{total_races}件")
+            m2.metric("的中回数", f"{hit_count_13}回")
+            m3.metric("賭け金合計", f"{stake_13:,}円")
+            m4.metric("回収率", f"{recovery_rate_13:.1f}%")
+            st.caption(f"払戻金合計(的中分): {return_13:,}円")
 
+            st.subheader("2連単 1-4 のみ買い続けた場合")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("対象レース数", f"{total_races}件")
+            m2.metric("的中回数", f"{hit_count_14}回")
+            m3.metric("賭け金合計", f"{stake_14:,}円")
+            m4.metric("回収率", f"{recovery_rate_14:.1f}%")
+            st.caption(f"払戻金合計(的中分): {return_14:,}円")
+
+            total_return = return_13 + return_14
+            total_stake = stake_13 + stake_14
+            recovery_rate = (total_return / total_stake * 100) if total_stake > 0 else 0.0
             st.caption(
-                f"賭け金合計: {FIXED_BET_AMOUNT}円 × 2点 × {total_races}件 = {total_stake:,}円 / "
-                f"払戻金合計(的中分): {total_return:,}円"
+                f"(参考)1-3・1-4 合計: 賭け金合計 {total_stake:,}円 / "
+                f"払戻金合計 {total_return:,}円 / 回収率 {recovery_rate:.1f}%"
             )
 
             if total_races < SAMPLE_SIZE_WARNING_THRESHOLD:
