@@ -86,9 +86,24 @@ def rate_label(stats_df, toban):
 def find_qualifying_races(entries_df, c1_stats, c2_stats):
     """①1号艇イン逃げ率・②2号艇逃し率の両条件を満たすレース(1号艇・2号艇の
     出走表ペア)を抽出する。entries_dfは対象を絞ったentries(例: 当日分のみ、
-    または全期間)を渡す。"""
-    qualified_toban1 = set(c1_stats[c1_stats["rate"] >= INN_NIGE_RATE_THRESHOLD].index)
-    qualified_toban2 = set(c2_stats[c2_stats["rate"] >= NIGASHI_RATE_THRESHOLD].index)
+    または全期間)を渡す。
+
+    starts(出走回数)がSAMPLE_SIZE_WARNING_THRESHOLD未満の選手は対象から除く。
+    サンプル数が少ないと、算術的に閾値(80%/50%)を満たせるのは「全勝/全敗」の
+    選手だけになり、③の「実際に逃げた割合」検証が予測に使った実績とほぼ同じ
+    レースを数え直すだけになって100%に張り付くデータリーケージが起きるため。"""
+    qualified_toban1 = set(
+        c1_stats[
+            (c1_stats["rate"] >= INN_NIGE_RATE_THRESHOLD)
+            & (c1_stats["starts"] >= SAMPLE_SIZE_WARNING_THRESHOLD)
+        ].index
+    )
+    qualified_toban2 = set(
+        c2_stats[
+            (c2_stats["rate"] >= NIGASHI_RATE_THRESHOLD)
+            & (c2_stats["starts"] >= SAMPLE_SIZE_WARNING_THRESHOLD)
+        ].index
+    )
 
     entries1 = entries_df[entries_df["waku"] == 1][
         ["race_date", "jcd", "rno", "toban", "racer_name", "venue_name"]
