@@ -1,0 +1,126 @@
+name: Scrape Watchdog
+
+on:
+  schedule:
+    # 毎日 UTC 22:47 = 日本時間 翌7:47頃。
+    # daily-scrape.yml の本来の発火時刻(UTC 18:37、JST 3:37頃)から
+    # 4時間以上の余裕を見て、前日分の結果が正常に(status='ok'で)
+    # 取得できているかを確認する。取得できていなければ自動で再取得を試み、
+    # それでも失敗する場合はIssueを作成して人間に知らせる。
+    - cron: "47 22 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: boatrace-daily-scrape
+  cancel-in-progress: false
+
+jobs:
+  check-and-heal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check whether yesterday's scrape completed
+        id: check
+        run: |
+          python - <<'EOF' >> "$GITHUB_OUTPUT"
+          import sqlite3
+          from datetime import datetime, timedelta, timezone
+
+          JST = timezone(timedelta(hours=9))
+          date_str = (datetime.now(JST) - timedelta(days=1)).strftime("%Y%m%d")
+
+          con = sqlite3.connect("data/boatrace.db")
+          row = con.execute(
+              "SELECT status FROM scrape_log WHERE race_date = ? ORDER BY finished_at DESC LIMIT 1",
+              (date_str,),
+          ).fetchone()
+          status = row[0] if row else "missing"
+
+          print(f"date={date_str}")
+          print(f"status={status}")
+          print(f"needs_retry={'true' if status != 'ok' else 'false'}")
+          EOF
+
+      - name: Retry scrape for missing date
+        id: retry
+        if: steps.check.outputs.needs_retry == 'true'
+        # boatrace_scraper.pyは結果データが閾値未満(status=partial)だと
+        # 終了コード1を返す。ここで失敗扱いにしてジョブを止めてしまうと、
+        # 部分的に取れたデータのコミットや、失敗を伝えるIssue作成まで
+        # スキップされてしまうため、続行させる。
+        continue-on-error: true
+        env:
+          TARGET_DATE: ${{ steps.check.outputs.date }}
+        run: |
+          python boatrace_scraper.py --date "$TARGET_DATE" --interval 1.5
+
+      - name: Re-check status after retry
+        id: recheck
+        if: steps.check.outputs.needs_retry == 'true'
+        env:
+          TARGET_DATE: ${{ steps.check.outputs.date }}
+        run: |
+          python - <<'EOF' >> "$GITHUB_OUTPUT"
+          import os
+          import sqlite3
+
+          con = sqlite3.connect("data/boatrace.db")
+          row = con.execute(
+              "SELECT status FROM scrape_log WHERE race_date = ? ORDER BY finished_at DESC LIMIT 1",
+              (os.environ["TARGET_DATE"],),
+          ).fetchone()
+          status = row[0] if row else "missing"
+          print(f"status={status}")
+          EOF
+
+      - name: Commit and push recovered data
+        if: steps.check.outputs.needs_retry == 'true'
+        env:
+          TARGET_DATE: ${{ steps.check.outputs.date }}
+          RECOVERED_STATUS: ${{ steps.recheck.outputs.status }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/boatrace.db
+          if git diff --cached --quiet; then
+            echo "No data changes to commit."
+          else
+            git commit -m "chore: watchdog auto-recover $TARGET_DATE ($RECOVERED_STATUS)"
+            git fetch origin main
+            git rebase origin/main
+            git push
+          fi
+
+      - name: Open issue if recovery did not fully succeed
+        if: steps.check.outputs.needs_retry == 'true' && steps.recheck.outputs.status != 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_DATE: ${{ steps.check.outputs.date }}
+          RECOVERED_STATUS: ${{ steps.recheck.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create \
+            --title "スケジュール実行の欠落を検知: ${TARGET_DATE} が未取得(自動リトライも失敗)" \
+            --body "daily-scrape.yml の定期実行で ${TARGET_DATE} 分のデータが取得できていないことを検知し、scrape-watchdog.yml が自動リトライしましたが、status は \`${RECOVERED_STATUS}\` のままでした。手動での確認・再実行(workflow_dispatch)をお願いします。 [実行ログ](${RUN_URL})"
+
+      - name: Note successful auto-recovery
+        if: steps.check.outputs.needs_retry == 'true' && steps.recheck.outputs.status == 'ok'
+        env:
+          TARGET_DATE: ${{ steps.check.outputs.date }}
+        run: |
+          echo "Auto-recovered $TARGET_DATE: status=ok"
