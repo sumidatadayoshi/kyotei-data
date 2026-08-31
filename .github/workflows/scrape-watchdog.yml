@@ -36,29 +36,30 @@ jobs:
 
       - name: Check whether yesterday's scrape completed
         id: check
+        run: python check_scrape_status.py >> "$GITHUB_OUTPUT"
+
+      - name: Sync to latest main before retry
+        id: sync
+        if: steps.check.outputs.needs_retry == 'true'
+        # concurrency groupで待機している間にdaily-scrape.ymlが
+        # data/boatrace.dbを更新してpushしている可能性がある。ここで
+        # 最新化しておかないと、古いベースの上でリトライ・コミットしてしまい、
+        # push直前のrebaseでdata/boatrace.db(バイナリ)がコンフリクトして
+        # ジョブごと失敗する(2026-08-29に実際発生)。
         run: |
-          python - <<'EOF' >> "$GITHUB_OUTPUT"
-          import sqlite3
-          from datetime import datetime, timedelta, timezone
+          git fetch origin main
+          git reset --hard origin/main
 
-          JST = timezone(timedelta(hours=9))
-          date_str = (datetime.now(JST) - timedelta(days=1)).strftime("%Y%m%d")
-
-          con = sqlite3.connect("data/boatrace.db")
-          row = con.execute(
-              "SELECT status FROM scrape_log WHERE race_date = ? ORDER BY finished_at DESC LIMIT 1",
-              (date_str,),
-          ).fetchone()
-          status = row[0] if row else "missing"
-
-          print(f"date={date_str}")
-          print(f"status={status}")
-          print(f"needs_retry={'true' if status != 'ok' else 'false'}")
-          EOF
+      - name: Re-check after sync
+        id: presync_check
+        if: steps.check.outputs.needs_retry == 'true'
+        env:
+          TARGET_DATE: ${{ steps.check.outputs.date }}
+        run: python check_scrape_status.py "$TARGET_DATE" >> "$GITHUB_OUTPUT"
 
       - name: Retry scrape for missing date
         id: retry
-        if: steps.check.outputs.needs_retry == 'true'
+        if: steps.presync_check.outputs.needs_retry == 'true'
         # boatrace_scraper.pyは結果データが閾値未満(status=partial)だと
         # 終了コード1を返す。ここで失敗扱いにしてジョブを止めてしまうと、
         # 部分的に取れたデータのコミットや、失敗を伝えるIssue作成まで
@@ -74,19 +75,7 @@ jobs:
         if: steps.check.outputs.needs_retry == 'true'
         env:
           TARGET_DATE: ${{ steps.check.outputs.date }}
-        run: |
-          python - <<'EOF' >> "$GITHUB_OUTPUT"
-          import os
-          import sqlite3
-
-          con = sqlite3.connect("data/boatrace.db")
-          row = con.execute(
-              "SELECT status FROM scrape_log WHERE race_date = ? ORDER BY finished_at DESC LIMIT 1",
-              (os.environ["TARGET_DATE"],),
-          ).fetchone()
-          status = row[0] if row else "missing"
-          print(f"status={status}")
-          EOF
+        run: python check_scrape_status.py "$TARGET_DATE" >> "$GITHUB_OUTPUT"
 
       - name: Commit and push recovered data
         if: steps.check.outputs.needs_retry == 'true'
