@@ -1,0 +1,66 @@
+name: Backfill Odds
+
+on:
+  schedule:
+    # 毎日 UTC 23:10 = 日本時間 翌8:10頃。daily-scrape.yml(UTC 18:37発火)や
+    # scrape-watchdog.yml(UTC 22:47発火)より後ろに置き、concurrency groupの
+    # 待機列で自然にその後ろへ並ぶようにしている。
+    - cron: "10 23 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "1回の実行で処理するレース数の上限"
+        required: false
+        default: "100"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: boatrace-daily-scrape
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    # 1レースあたり約1分(オッズ5ページ分)。デフォルト100件/回を
+    # 十分な余裕を持って処理できる時間を確保している。
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backfill odds for past races
+        env:
+          LIMIT: ${{ github.event.inputs.limit || '100' }}
+        run: python boatrace_scraper.py --backfill-odds --backfill-odds-limit "$LIMIT"
+
+      - name: Merge onto latest main and push
+        # data/boatrace.dbはバイナリのため、他のワークフロー(daily-scrape.yml/
+        # scrape-watchdog.yml)が実行中にpushしているとgit rebase/mergeが
+        # 解消不能なコンフリクトになる(2026-08-29にscrape-watchdog.ymlで
+        # 実際発生した問題と同種)。バックフィルは1回の実行が数十分かかり
+        # 発生しやすいため、「pushの直前に最新化し、今回追加したoddsの行だけを
+        # SQLレベルで再適用する」ことでバイナリのコンフリクトを避ける。
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cp data/boatrace.db /tmp/backfilled.db
+          git fetch origin main
+          git reset --hard origin/main
+          python merge_odds_table.py /tmp/backfilled.db data/boatrace.db
+          git add data/boatrace.db
+          if git diff --cached --quiet; then
+            echo "No odds changes to commit."
+          else
+            git commit -m "chore: backfill odds ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            git push
+          fi
