@@ -21,7 +21,9 @@ concurrency:
 jobs:
   check-and-heal:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # リトライ時はdaily-scrape.ymlと同様に1日分をまるごと再取得するため、
+    # 締切時オッズ追加後の所要時間(daily-scrape.yml参照)に合わせて延長している。
+    timeout-minutes: 300
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

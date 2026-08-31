@@ -461,6 +461,190 @@ def parse_race_result(html_text):
 
 
 # ---------------------------------------------------------------------------
+# 締切時オッズ (oddstf/odds2tf/odds3f/odds3t/oddsk) の解析
+#
+# 単勝・複勝ページ(oddstf)は艇番ごとに1行のシンプルな表だが、
+# 2連単・2連複・拡連複・3連複・3連単の各ページは「6艇の組み合わせ表」を
+# HTMLのrowspanで表現したグリッドになっている。rowspanをそのまま
+# BeautifulSoupで読むと後続セルの位置がずれるため、まずグリッド全体を
+# 展開してから列位置(艇番ブロック)に基づいて値を取り出す。
+# ---------------------------------------------------------------------------
+
+def parse_odds_value(text):
+    """'12.3' -> (12.3, None)。'1.2-1.5' (複勝・拡連複などのレンジ表記)
+    -> (1.2, 1.5)。値なし('---'など)は (None, None)。"""
+    text = (text or "").strip()
+    if not text or text in ("-", "--", "---"):
+        return None, None
+    if "-" in text:
+        lo, hi = text.split("-", 1)
+        return to_float(lo), to_float(hi)
+    return to_float(text), None
+
+
+def expand_grid_rows(tbody):
+    """rowspanで畳まれたtbodyを、セルが省略されない完全なグリッド
+    (行ごとの {列インデックス: (テキスト, cssクラス一覧)} の辞書)に展開する。"""
+    carry = {}
+    grid = []
+    for tr in tbody.find_all("tr", recursive=False):
+        cells = tr.find_all("td", recursive=False)
+        row = {}
+        col = 0
+        ci = 0
+        while ci < len(cells) or col in carry:
+            if col in carry:
+                remaining, text, classes = carry[col]
+                row[col] = (text, classes)
+                if remaining - 1 <= 0:
+                    del carry[col]
+                else:
+                    carry[col] = (remaining - 1, text, classes)
+                col += 1
+                continue
+            cell = cells[ci]
+            ci += 1
+            text = nfkc(cell.get_text(strip=True))
+            classes = cell.get("class") or []
+            rowspan = int(cell.get("rowspan", 1) or 1)
+            row[col] = (text, classes)
+            if rowspan > 1:
+                carry[col] = (rowspan - 1, text, classes)
+            col += 1
+        grid.append(row)
+    return grid
+
+
+def block_boat_numbers(thead):
+    """グリッド表のヘッダーから、左から順に並ぶ艇番ブロックの艇番一覧を返す。"""
+    boats = []
+    for th in thead.find_all("th"):
+        classes = th.get("class") or []
+        if th.get("colspan"):
+            continue
+        if not any(c.startswith("is-boatColor") for c in classes):
+            continue
+        n = to_int(nfkc(th.get_text(strip=True)))
+        if n is not None:
+            boats.append(n)
+    return boats
+
+
+def parse_odds_point_table(table):
+    """oddstfページ(単勝・複勝)の1艇1行×tbody形式を解析する。"""
+    out = []
+    for tb in table.find_all("tbody"):
+        tr = tb.find("tr")
+        if tr is None:
+            continue
+        tds = tr.find_all("td")
+        if len(tds) < 3:
+            continue
+        boat = to_int(nfkc(tds[0].get_text(strip=True)))
+        if boat is None:
+            continue
+        out.append((boat, nfkc(tds[2].get_text(strip=True))))
+    return out
+
+
+def parse_odds_grid_2level(table):
+    """2連単・2連複・拡連複ページの「6ブロック×2列(相手艇番, オッズ)」
+    グリッドを解析し、(艇1, 艇2, オッズ文字列) のリストを返す。
+    2連複・拡連複は艇1<艇2の組み合わせのみ埋まっており、それ以外は
+    is-disabledセルなのでスキップする。"""
+    thead = table.find("thead")
+    tbody = table.find("tbody")
+    boats = block_boat_numbers(thead)
+    out = []
+    for row in expand_grid_rows(tbody):
+        for bi, boat1 in enumerate(boats):
+            base = bi * 2
+            c0, c1 = row.get(base), row.get(base + 1)
+            if c0 is None or c1 is None or "is-disabled" in c0[1]:
+                continue
+            boat2 = to_int(c0[0])
+            if boat2 is None:
+                continue
+            out.append((boat1, boat2, c1[0]))
+    return out
+
+
+def parse_odds_grid_3level(table):
+    """3連単・3連複ページの「6ブロック×3列(2着候補, 3着候補, オッズ)」
+    グリッドを解析し、(艇1, 艇2, 艇3, オッズ文字列) のリストを返す。"""
+    thead = table.find("thead")
+    tbody = table.find("tbody")
+    boats = block_boat_numbers(thead)
+    out = []
+    for row in expand_grid_rows(tbody):
+        for bi, boat1 in enumerate(boats):
+            base = bi * 3
+            c0, c1, c2 = row.get(base), row.get(base + 1), row.get(base + 2)
+            if c0 is None or c1 is None or c2 is None or "is-disabled" in c0[1]:
+                continue
+            boat2, boat3 = to_int(c0[0]), to_int(c1[0])
+            if boat2 is None or boat3 is None:
+                continue
+            out.append((boat1, boat2, boat3, c2[0]))
+    return out
+
+
+# (ページのURLスラッグ, [(bet_type, ページ内での表の順序(先頭のレース選択
+#  ナビ表を除く), 表の形状, 艇番の並び順が意味を持つか), ...])
+ODDS_PAGE_SPECS = [
+    ("oddstf", [("単勝", 0, "point", None), ("複勝", 1, "point", None)]),
+    ("odds2tf", [("2連単", 0, "pair", True), ("2連複", 1, "pair", False)]),
+    ("odds3f", [("3連複", 0, "triple", False)]),
+    ("odds3t", [("3連単", 0, "triple", True)]),
+    ("oddsk", [("拡連複", 0, "pair", False)]),
+]
+
+
+def _odds_rows_from_table(table, shape, ordered):
+    if shape == "point":
+        for boat, text in parse_odds_point_table(table):
+            lo, hi = parse_odds_value(text)
+            if lo is not None:
+                yield str(boat), lo, hi
+    elif shape == "pair":
+        sep = "-" if ordered else "="
+        for b1, b2, text in parse_odds_grid_2level(table):
+            lo, hi = parse_odds_value(text)
+            if lo is not None:
+                yield f"{b1}{sep}{b2}", lo, hi
+    else:  # triple
+        sep = "-" if ordered else "="
+        for b1, b2, b3, text in parse_odds_grid_3level(table):
+            lo, hi = parse_odds_value(text)
+            if lo is not None:
+                yield f"{b1}{sep}{b2}{sep}{b3}", lo, hi
+
+
+def fetch_race_odds(session, jcd, rno, date_str):
+    """締切時オッズ(単勝・複勝・2連単・2連複・3連複・3連単・拡連複の全7種)を
+    5ページ取得する。1ページの取得に失敗しても、そのページ分の舟券種のみ
+    欠落させて他のページの取得を続ける。"""
+    rows = []
+    for page, table_specs in ODDS_PAGE_SPECS:
+        url = f"{BASE_URL}/owpc/pc/race/{page}?rno={rno}&jcd={jcd}&hd={date_str}"
+        html_text = session.get(url)
+        if html_text is None:
+            logger.warning("オッズ取得失敗(%s): jcd=%s rno=%s", page, jcd, rno)
+            continue
+        # 先頭はどのオッズページにも共通の「レース選択」ナビ表なので除く
+        tables = BeautifulSoup(html_text, "lxml").find_all("table")[1:]
+        for bet_type, idx, shape, ordered in table_specs:
+            if idx >= len(tables):
+                logger.warning(
+                    "オッズページの構造が想定と異なります(%s/%s): jcd=%s rno=%s", page, bet_type, jcd, rno
+                )
+                continue
+            for combination, lo, hi in _odds_rows_from_table(tables[idx], shape, ordered):
+                rows.append({"bet_type": bet_type, "combination": combination, "odds_low": lo, "odds_high": hi})
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # DB
 # ---------------------------------------------------------------------------
 
@@ -542,6 +726,19 @@ CREATE TABLE IF NOT EXISTS payouts (
     combination TEXT NOT NULL,
     payout INTEGER,
     popularity TEXT,
+    fetched_at TEXT,
+    PRIMARY KEY (race_date, jcd, rno, bet_type, combination)
+);
+
+CREATE TABLE IF NOT EXISTS odds (
+    race_date TEXT NOT NULL,
+    jcd TEXT NOT NULL,
+    venue_name TEXT,
+    rno INTEGER NOT NULL,
+    bet_type TEXT NOT NULL,
+    combination TEXT NOT NULL,
+    odds_low REAL,
+    odds_high REAL,
     fetched_at TEXT,
     PRIMARY KEY (race_date, jcd, rno, bet_type, combination)
 );
@@ -657,6 +854,17 @@ def save_payouts(conn, race_date, jcd, venue_name, rno, payouts, fetched_at):
             VALUES (?,?,?,?,?,?,?,?,?)""",
             (race_date, jcd, venue_name, rno, p["bet_type"], p["combination"], p["payout"],
              p["popularity"], fetched_at),
+        )
+
+
+def save_odds(conn, race_date, jcd, venue_name, rno, odds_rows, fetched_at):
+    for o in odds_rows:
+        conn.execute(
+            """INSERT OR REPLACE INTO odds
+            (race_date, jcd, venue_name, rno, bet_type, combination, odds_low, odds_high, fetched_at)
+            VALUES (?,?,?,?,?,?,?,?,?)""",
+            (race_date, jcd, venue_name, rno, o["bet_type"], o["combination"], o["odds_low"],
+             o["odds_high"], fetched_at),
         )
 
 
@@ -808,6 +1016,56 @@ def backfill_grades(db_path, interval_sec=1.5):
 
 
 # ---------------------------------------------------------------------------
+# 過去レースのオッズ補完: resultsが存在する(=終了している)のにoddsが
+# 1件も無いレースについて、締切時オッズを後から取得する。
+# 1レースあたり5ページの追加リクエストが必要なため、対象件数によっては
+# 非常に時間がかかる。--backfill-odds-limit で1回の実行での処理件数の
+# 上限を指定でき、複数回に分けて(例: 日次ジョブに少しずつ追記する形で)
+# 完走させることを想定している。
+# ---------------------------------------------------------------------------
+
+def backfill_odds(db_path, interval_sec=1.5, limit=None):
+    session = PoliteSession(interval_sec=interval_sec)
+    conn = get_connection(db_path)
+
+    targets = conn.execute(
+        """SELECT DISTINCT r.race_date, r.jcd, r.venue_name, r.rno
+        FROM races r
+        JOIN results res ON res.race_date = r.race_date AND res.jcd = r.jcd AND res.rno = r.rno
+        LEFT JOIN odds o ON o.race_date = r.race_date AND o.jcd = r.jcd AND o.rno = r.rno
+        WHERE o.race_date IS NULL
+        ORDER BY r.race_date, r.jcd, r.rno"""
+    ).fetchall()
+
+    total_remaining = len(targets)
+    if limit:
+        targets = targets[:limit]
+
+    if not targets:
+        logger.info("オッズ補完対象のレースはありません。")
+        conn.close()
+        return 0
+
+    logger.info("オッズ補完対象: 今回%d件 (未補完全体: %d件)", len(targets), total_remaining)
+    updated = 0
+    for race_date, jcd, venue_name, rno in targets:
+        odds_rows = fetch_race_odds(session, jcd, rno, race_date)
+        if not odds_rows:
+            logger.warning("オッズ補完: データ取得できず date=%s jcd=%s rno=%s", race_date, jcd, rno)
+            continue
+        fetched_at = datetime.now().isoformat(timespec="seconds")
+        save_odds(conn, race_date, jcd, venue_name, rno, odds_rows, fetched_at)
+        conn.commit()
+        updated += 1
+        if updated % 20 == 0:
+            logger.info("オッズ補完: %d/%d件完了", updated, len(targets))
+
+    conn.close()
+    logger.info("オッズ補完完了: 今回%d/%d件 (残り: %d件)", updated, len(targets), total_remaining - updated)
+    return updated
+
+
+# ---------------------------------------------------------------------------
 # メイン処理
 # ---------------------------------------------------------------------------
 
@@ -858,11 +1116,19 @@ def scrape_day(date_str, db_path, interval_sec=1.5):
             if payouts:
                 save_payouts(conn, date_str, jcd, venue_name, rno, payouts, fetched_at)
 
+            # 締切時オッズ(全7舟券種)。レースが終了しているため既に確定済みの値であり、
+            # リアルタイム性を気にする必要はない。1レースあたり5ページ追加で
+            # リクエストするため、日次取得の所要時間が大きく伸びる点に注意。
+            odds_rows = fetch_race_odds(session, jcd, rno, date_str)
+            if odds_rows:
+                odds_fetched_at = datetime.now().isoformat(timespec="seconds")
+                save_odds(conn, date_str, jcd, venue_name, rno, odds_rows, odds_fetched_at)
+
             conn.commit()
             races_count += 1
             logger.info(
-                "jcd=%s %dR 保存完了 (entries=%d, results=%d, payouts=%d)",
-                jcd, rno, len(entries), len(results), len(payouts),
+                "jcd=%s %dR 保存完了 (entries=%d, results=%d, payouts=%d, odds=%d)",
+                jcd, rno, len(entries), len(results), len(payouts), len(odds_rows),
             )
 
     # 結果データの完全性チェック。
@@ -986,6 +1252,16 @@ def main():
         help="racesテーブルでgradeが未取得(NULL)の行について、該当ページを"
              "再取得してgradeだけを補完し終了する。他の取得は行わない。",
     )
+    parser.add_argument(
+        "--backfill-odds", action="store_true",
+        help="resultsが存在するのにoddsが未取得のレースについて、締切時オッズを"
+             "補完し終了する。他の取得は行わない。",
+    )
+    parser.add_argument(
+        "--backfill-odds-limit", type=int, default=None,
+        help="--backfill-odds使用時、1回の実行で処理するレース数の上限。"
+             "省略時は未補完分をすべて処理する。",
+    )
     args = parser.parse_args()
 
     if args.date:
@@ -1013,6 +1289,11 @@ def main():
     if args.backfill_grades:
         logger.info("グレード補完開始: db=%s", args.db)
         backfill_grades(args.db, interval_sec=args.interval)
+        return
+
+    if args.backfill_odds:
+        logger.info("オッズ補完開始: db=%s limit=%s", args.db, args.backfill_odds_limit)
+        backfill_odds(args.db, interval_sec=args.interval, limit=args.backfill_odds_limit)
         return
 
     if args.entries_only:

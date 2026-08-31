@@ -33,7 +33,9 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # 締切時オッズ(1レースあたり5ページ追加)の取得により所要時間が
+    # 従来(約1時間)の3~4倍程度に伸びるため、余裕を持たせている。
+    timeout-minutes: 300
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
