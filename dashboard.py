@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -50,6 +51,38 @@ def format_yen(v):
 
 def fmt_date(d):
     return f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
+
+
+def bootstrap_recovery_rate_ci(race_date, hit, payout, bet_amount=100, n_resamples=2000, seed=42):
+    """レース単位の race_date/hit(0or1)/payout(円。外れは0)の配列から、
+    回収率のブートストラップ信頼区間を計算する汎用関数。どの券種・
+    どの買い目にも使い回せる(呼び出し側でhit/payoutの定義を変えるだけでよい)。
+
+    race_date(開催日)単位でグループ化し、ユニークな日付を重複を許して
+    同数だけ再抽出する「ブロックブートストラップ」を行う。同じ日の結果は
+    天候などの条件で相関しうるため、レース単位ではなく日単位でまとめて
+    再抽出する。
+
+    戻り値: (lower, upper, rates) — rates はn_resamples個の回収率(%)の配列、
+    lower/upperはその2.5パーセンタイル・97.5パーセンタイル(95%信頼区間)。
+    """
+    df = pd.DataFrame({"race_date": race_date, "hit": hit, "payout": payout})
+    daily = df.groupby("race_date").agg(n=("payout", "size"), payout_sum=("payout", "sum"))
+    n_dates = len(daily)
+    if n_dates == 0:
+        return 0.0, 0.0, np.array([])
+
+    n_arr = daily["n"].to_numpy()
+    payout_arr = daily["payout_sum"].to_numpy()
+
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n_dates, size=(n_resamples, n_dates))
+    total_stake = n_arr[idx].sum(axis=1) * bet_amount
+    total_return = payout_arr[idx].sum(axis=1)
+    rates = np.where(total_stake > 0, total_return / total_stake * 100, 0.0)
+
+    lower, upper = np.percentile(rates, [2.5, 97.5])
+    return lower, upper, rates
 
 
 def compute_racer_rate_stats(entries_all, results_all):
@@ -718,15 +751,32 @@ else:
     hit_rate = (total_hits / total_races * 100) if total_races > 0 else 0.0
     recovery_rate = (total_return / total_stake * 100) if total_stake > 0 else 0.0
 
+    race_level_hit = (payouts_all_2tan["combination"] == ALL_IN_COMBO).astype(int)
+    race_level_payout = np.where(race_level_hit == 1, payouts_all_2tan["payout"], 0)
+    ci_lower, ci_upper, boot_rates = bootstrap_recovery_rate_ci(
+        payouts_all_2tan["race_date"], race_level_hit, race_level_payout,
+        bet_amount=ALL_IN_BET_AMOUNT,
+    )
+
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("対象レース数", f"{total_races}件")
     m2.metric("的中回数", f"{total_hits}回")
     m3.metric("通算的中率", f"{hit_rate:.1f}%")
     m4.metric("通算回収率", f"{recovery_rate:.1f}%")
+    st.write(f"通算回収率: {recovery_rate:.1f}%(95%信頼区間: {ci_lower:.1f}%〜{ci_upper:.1f}%)")
     st.caption(
         f"賭け金合計: {total_stake:,}円 / 払戻金合計: {total_return:,}円 / "
-        f"通算収支: {total_return - total_stake:,}円"
+        f"通算収支: {total_return - total_stake:,}円 / "
+        "信頼区間は開催日単位でのブロックブートストラップ(2000回、乱数シード固定)により算出。"
     )
+
+    if len(boot_rates) > 0:
+        hist_counts, bin_edges = np.histogram(boot_rates, bins=30)
+        hist_df = pd.DataFrame(
+            {"回収率(%)": [f"{bin_edges[i]:.0f}" for i in range(len(bin_edges) - 1)], "頻度": hist_counts}
+        ).set_index("回収率(%)")
+        st.write("**回収率のブートストラップ分布(2000回)**")
+        st.bar_chart(hist_df)
 
     chart_df = daily.reset_index().rename(columns={"race_date": "日付"})
     chart_df["日付"] = chart_df["日付"].apply(fmt_date)
