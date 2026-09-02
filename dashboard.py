@@ -8,6 +8,9 @@ BOATRACEデータの動作確認用ダッシュボード。
 1号艇のイン逃げ率・2号艇の逃し率という簡易な統計に基づく実験的機能。
 データ量が少ないうちはサンプル数が少なく参考にならない点に注意。
 
+ページ下部の「🎉 番外編(お遊びコーナー)」は、真面目な分析とは別枠の
+遊び心重視の実験的機能(全レース1-2買い続けカウンター・江戸川スコア)。
+
 使い方:
     streamlit run dashboard.py
 """
@@ -663,6 +666,152 @@ else:
 
             if total_races < SAMPLE_SIZE_WARNING_THRESHOLD:
                 st.warning("⚠️ 対象レース数(母数)が少なく、参考データ不足です。")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# 🎉 番外編(お遊びコーナー)
+#
+# ここから下は、上の真面目な回収率分析とは切り離した遊び心優先の実験的
+# コンテンツ。条件による絞り込みは行わず、DBにある全レース・全期間の
+# データをそのまま使う。
+# ---------------------------------------------------------------------------
+st.header("🎉 番外編(お遊びコーナー)")
+st.caption("ここから下は、真面目な分析とは別枠の遊び心重視の実験的コンテンツです。")
+
+# ---------------------------------------------------------------------------
+# 🐎 もし全レース「2連単 1-2」を買い続けていたら カウンター
+#
+# 条件による絞り込みは一切せず、データベースにある結果判明済みの全レースで
+# 機械的に2連単「1-2」を100円ずつ買い続けたと仮定した場合の収支を集計する。
+# ---------------------------------------------------------------------------
+st.subheader("🐎 もし全レース「2連単 1-2」を買い続けていたら")
+st.caption(
+    "条件による絞り込みは一切せず、データベースにある結果判明済みの全レースで、"
+    "機械的に2連単「1-2」を100円ずつ買い続けたと仮定した場合の収支です。"
+)
+
+ALL_IN_BET_AMOUNT = 100
+ALL_IN_COMBO = "1-2"
+
+payouts_all_2tan = load_df(
+    "SELECT race_date, jcd, combination, payout FROM payouts WHERE bet_type = '2連単'"
+)
+
+if payouts_all_2tan.empty:
+    st.info("集計対象の結果データがまだありません。")
+else:
+    daily = payouts_all_2tan.groupby("race_date").agg(レース数=("combination", "size"))
+    daily["投資額"] = daily["レース数"] * ALL_IN_BET_AMOUNT
+    hits_all = payouts_all_2tan[payouts_all_2tan["combination"] == ALL_IN_COMBO]
+    daily_payout = hits_all.groupby("race_date")["payout"].sum().rename("払戻額")
+    daily = daily.join(daily_payout, how="left")
+    daily["払戻額"] = daily["払戻額"].fillna(0).astype(int)
+    daily["収支"] = daily["払戻額"] - daily["投資額"]
+    daily = daily.sort_index()
+    daily["累計収支"] = daily["収支"].cumsum()
+
+    total_races = len(payouts_all_2tan)
+    total_hits = len(hits_all)
+    total_stake = total_races * ALL_IN_BET_AMOUNT
+    total_return = int(hits_all["payout"].sum())
+    hit_rate = (total_hits / total_races * 100) if total_races > 0 else 0.0
+    recovery_rate = (total_return / total_stake * 100) if total_stake > 0 else 0.0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("対象レース数", f"{total_races}件")
+    m2.metric("的中回数", f"{total_hits}回")
+    m3.metric("通算的中率", f"{hit_rate:.1f}%")
+    m4.metric("通算回収率", f"{recovery_rate:.1f}%")
+    st.caption(
+        f"賭け金合計: {total_stake:,}円 / 払戻金合計: {total_return:,}円 / "
+        f"通算収支: {total_return - total_stake:,}円"
+    )
+
+    chart_df = daily.reset_index().rename(columns={"race_date": "日付"})
+    chart_df["日付"] = chart_df["日付"].apply(fmt_date)
+
+    st.write("**日ごとの収支**")
+    st.dataframe(
+        chart_df[["日付", "レース数", "投資額", "払戻額", "収支"]],
+        hide_index=True, use_container_width=True,
+    )
+
+    st.write("**日ごとの収支の推移**")
+    st.line_chart(chart_df.set_index("日付")[["収支"]])
+
+    st.write("**累計収支の推移**")
+    st.line_chart(chart_df.set_index("日付")[["累計収支"]])
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# 🌊 江戸川スコア(実験的機能)
+#
+# 各競艇場の「荒れ具合」を、1号艇(1コース)の1着率の低さを基準に、
+# 江戸川を100とした指数で表示する。
+#
+# 計算式:
+#   荒れ指数 = (1 - 当該場の1号艇1着率) / (1 - 江戸川の1号艇1着率) × 100
+#
+# 1号艇の1着率が低い場ほど「1号艇が順当に逃げ切れず荒れやすい」とみなし、
+# 「荒れる場」として知られる江戸川を基準値100として相対比較する。数値が
+# 大きいほど江戸川より荒れやすく、小さいほど江戸川より堅い(1号艇が
+# 順当に勝ちやすい)ことを意味する。
+# ---------------------------------------------------------------------------
+st.subheader("🌊 江戸川スコア(競艇場の荒れ具合ランキング・実験的機能)")
+st.caption("1号艇(1コース)の1着率の低さを「荒れ具合」の指標とし、江戸川を100とした指数で全24場をランキングします。")
+st.info(
+    "**計算式**: 荒れ指数 = (1 − 当該場の1号艇1着率) ÷ (1 − 江戸川の1号艇1着率) × 100\n\n"
+    "1号艇の1着率が低い場ほど「1号艇が順当に勝ちきれず荒れやすい」とみなし、"
+    "『荒れる場』として知られる江戸川を基準値100として相対比較しています。"
+    "数値が大きいほど江戸川より荒れる、小さいほど江戸川より堅い(1号艇が勝ちやすい)"
+    "ことを意味します。"
+)
+
+EDOGAWA_JCD = "03"
+VENUE_SAMPLE_WARNING_THRESHOLD = 30
+
+waku1_results_all = results_all[results_all["waku"] == 1] if not results_all.empty else results_all
+venue_names = load_df("SELECT DISTINCT jcd, venue_name FROM races")
+
+if waku1_results_all.empty:
+    st.info("集計対象の結果データがまだありません。")
+else:
+    venue_stats = waku1_results_all.groupby("jcd").agg(
+        starts=("rank", "size"), wins=("rank", lambda s: (s == "1").sum())
+    )
+    venue_stats["win_rate"] = venue_stats["wins"] / venue_stats["starts"]
+
+    if EDOGAWA_JCD not in venue_stats.index or venue_stats.loc[EDOGAWA_JCD, "starts"] == 0:
+        st.info("江戸川の結果データがまだないため、指数を計算できません。")
+    else:
+        edogawa_win_rate = venue_stats.loc[EDOGAWA_JCD, "win_rate"]
+        if edogawa_win_rate >= 1.0:
+            st.info("江戸川で1号艇が全勝しており、基準値として使えません(0除算)。")
+        else:
+            venue_stats["荒れ指数"] = (1 - venue_stats["win_rate"]) / (1 - edogawa_win_rate) * 100
+            venue_stats = venue_stats.merge(
+                venue_names, left_index=True, right_on="jcd", how="left"
+            ).sort_values("荒れ指数", ascending=False)
+
+            venue_stats["場"] = venue_stats["venue_name"]
+            venue_stats["1号艇1着率"] = (venue_stats["win_rate"] * 100).map(lambda v: f"{v:.1f}%")
+            venue_stats["サンプル数(n)"] = venue_stats["starts"]
+            venue_stats["注意"] = venue_stats["starts"].apply(
+                lambda n: "⚠️参考データ不足" if n < VENUE_SAMPLE_WARNING_THRESHOLD else ""
+            )
+            venue_stats["荒れ指数"] = venue_stats["荒れ指数"].map(lambda v: f"{v:.1f}")
+
+            display_venue = venue_stats[
+                ["場", "荒れ指数", "1号艇1着率", "サンプル数(n)", "注意"]
+            ].reset_index(drop=True)
+            display_venue.index = display_venue.index + 1
+            st.dataframe(display_venue, use_container_width=True)
+            st.caption(
+                f"サンプル数(n)が{VENUE_SAMPLE_WARNING_THRESHOLD}件未満の場は参考データ不足です。"
+                "データ蓄積が進むにつれて数値は変動します。"
+            )
 
 st.divider()
 st.caption(f"DB: {DB_PATH}")
