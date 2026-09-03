@@ -2,12 +2,14 @@ name: Backfill History
 
 on:
   schedule:
-    # 毎日 UTC 16:00 = 日本時間 翌1:00頃。daily-scrape.yml(UTC 18:37発火)/
-    # scrape-watchdog.yml(UTC 22:47発火)/backfill-odds.yml(UTC 23:10発火)より
-    # 前に置き、concurrency groupの待機列の先頭でこのジョブが動くようにしている。
-    # 時間予算(既定3.5時間)+マージ処理を終えても、daily-scrape.ymlの発火まで
-    # 十分な余裕がある。
-    - cron: "0 16 * * *"
+    # 毎日 UTC 12:00 = 日本時間 21:00頃。時間予算(既定3.5時間)+日をまたぐ際の
+    # 超過分(最大1日分、実測で1日あたり最大1時間程度)+マージ処理を見込むと
+    # 終了はUTC 16:00〜16:40頃になり得るため、daily-scrape.yml(UTC 18:37発火)
+    # の開始前に確実に終わるよう、2時間以上の余裕を持たせてこの時刻に置いている。
+    # (当初UTC 16:00としていたが、上記の所要時間だとdaily-scrapeの開始時刻と
+    # 重なり、concurrency group([boatrace-daily-scrape])の待機列でdaily-scrape
+    # が毎晩1〜2時間程度遅延してしまうことが判明したため前倒しした。)
+    - cron: "0 12 * * *"
   workflow_dispatch:
     inputs:
       hours:
