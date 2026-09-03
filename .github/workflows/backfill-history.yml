@@ -2,20 +2,30 @@ name: Backfill History
 
 on:
   schedule:
-    # 毎日 UTC 12:00 = 日本時間 21:00頃。時間予算(既定3.5時間)+日をまたぐ際の
-    # 超過分(最大1日分、実測で1日あたり最大1時間程度)+マージ処理を見込むと
-    # 終了はUTC 16:00〜16:40頃になり得るため、daily-scrape.yml(UTC 18:37発火)
-    # の開始前に確実に終わるよう、2時間以上の余裕を持たせてこの時刻に置いている。
-    # (当初UTC 16:00としていたが、上記の所要時間だとdaily-scrapeの開始時刻と
-    # 重なり、concurrency group([boatrace-daily-scrape])の待機列でdaily-scrape
-    # が毎晩1〜2時間程度遅延してしまうことが判明したため前倒しした。)
-    - cron: "0 12 * * *"
+    # 1日3回(UTC 00:00 / 05:45 / 11:30)実行する。
+    #
+    # 実測したところ、1日分(出走表+結果のみ、オッズ抜き)の取得には約90分
+    # かかる(1.5秒間隔のポーリングよりも、1リクエストあたりの応答時間の方が
+    # 支配的なため)。GitHub Actionsは1ジョブ6時間が上限のため、1回の実行で
+    # 処理できる日数には限りがあり(時間予算3.75時間で1回あたり2〜3日分)、
+    # 1日1回の実行だけでは対象期間(直近3年)を終えるのに1年以上かかって
+    # しまう計算になった。そこで、他のジョブ(daily-scrape.yml: UTC 18:37発火/
+    # scrape-watchdog.yml: UTC 22:47発火/backfill-odds.yml: UTC 23:10発火)が
+    # 動いていない空き時間帯(だいたいUTC 00:00〜16:30の間)に3回分詰め込み、
+    # concurrency group([boatrace-daily-scrape])の待機列で安全に直列実行させる
+    # ことで、実質的なスループットを3倍に上げている。
+    # 最後の11:30発火分は、時間予算(3.75時間)+日をまたぐ際の超過分(最大で
+    # 1日分、実測で最大2時間程度)+マージ処理を見込んでも、daily-scrape.yml
+    # の開始(UTC 18:37)より前に十分な余裕を持って終わるよう設計している。
+    - cron: "0 0 * * *"
+    - cron: "45 5 * * *"
+    - cron: "30 11 * * *"
   workflow_dispatch:
     inputs:
       hours:
         description: "1回の実行に使う時間予算(時間)"
         required: false
-        default: "3.5"
+        default: "3.75"
 
 permissions:
   contents: write
@@ -28,11 +38,11 @@ concurrency:
 jobs:
   backfill-history:
     runs-on: ubuntu-latest
-    # 時間予算(既定3.5時間)を使い切っても、処理中の日を最後まで終えてから
-    # 終了するため多少超過し得る。そのオーバーヘッド+マージ/pushの時間を
-    # 見込んで余裕を持たせているが、GitHub Actionsの1ジョブ上限(6時間)には
-    # 収まるようにしている。
-    timeout-minutes: 270
+    # 時間予算(既定3.75時間)を使い切っても、処理中の日を最後まで終えてから
+    # 終了するため超過し得る(実測で1日あたり最大2時間程度)。そのオーバー
+    # ヘッド+マージ/pushの時間を見込んでも、GitHub Actionsの1ジョブ上限
+    # (6時間=360分)には収まるよう、10分の安全マージンを取っている。
+    timeout-minutes: 350
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -53,7 +63,7 @@ jobs:
         # 後続ステップで必ず行うため)、終了コードだけ記録して続行する。
         id: backfill
         env:
-          HOURS: ${{ github.event.inputs.hours || '3.5' }}
+          HOURS: ${{ github.event.inputs.hours || '3.75' }}
         run: |
           set +e
           python boatrace_scraper.py --backfill-history --backfill-history-hours "$HOURS" --interval 1.5
