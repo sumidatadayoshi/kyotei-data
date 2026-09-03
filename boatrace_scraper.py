@@ -129,15 +129,28 @@ def extract_grade(soup):
     return None
 
 
-class PoliteSession:
-    """アクセス間隔を必ず空けるrequests.Sessionのラッパー。"""
+class AccessBlockedError(Exception):
+    """403/429などアクセス制限の疑いがあるレスポンスを検知した際に送出される。
+    raise_on_block=Trueのセッションでのみ発生し、呼び出し元の処理を即座に
+    停止させることを意図している(現状はバックフィル処理でのみ使用)。"""
 
-    def __init__(self, interval_sec=1.5, timeout=15, max_retries=3):
+
+class PoliteSession:
+    """アクセス間隔を必ず空けるrequests.Sessionのラッパー。
+
+    raise_on_block=True の場合、403/429を検知すると通常のリトライで
+    畳みかけることを避けるため一度だけ長めに待って再確認し、それでも
+    ブロックされていればAccessBlockedErrorを送出して即座に諦める。
+    既存の日次スクレイピング(daily-scrape.yml等)には影響を与えないよう、
+    デフォルトはFalse(従来通りログを出して他ページの取得を続ける)。"""
+
+    def __init__(self, interval_sec=1.5, timeout=15, max_retries=3, raise_on_block=False):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.interval_sec = interval_sec
         self.timeout = timeout
         self.max_retries = max_retries
+        self.raise_on_block = raise_on_block
         self._last_request_at = 0.0
 
     def get(self, url):
@@ -153,6 +166,14 @@ class PoliteSession:
                 if resp.status_code == 200:
                     resp.encoding = "utf-8"
                     return resp.text
+                if resp.status_code in (403, 429) and self.raise_on_block:
+                    logger.error(
+                        "HTTP %s (アクセス制限の疑い) for %s (attempt %d)", resp.status_code, url, attempt
+                    )
+                    if attempt >= 2:
+                        raise AccessBlockedError(f"HTTP {resp.status_code} received for {url}")
+                    time.sleep(10)
+                    continue
                 logger.warning("HTTP %s for %s (attempt %d)", resp.status_code, url, attempt)
             except requests.RequestException as exc:
                 last_exc = exc
@@ -1066,11 +1087,98 @@ def backfill_odds(db_path, interval_sec=1.5, limit=None):
 
 
 # ---------------------------------------------------------------------------
+# 過去日付の一括バックフィル: races/entries/results/payoutsのみを対象に、
+# 現在DBに入っている最古のrace_dateより前の日を、開始境界(既定2016-09-01。
+# 公式サイトの現行フォーマットで閲覧できると確認できた最も古い時期)まで
+# 1日ずつ古い方向へ遡って取得する。オッズは対象外(--backfill-oddsで別途扱う)。
+#
+# 進捗は別テーブルで管理せず、「DB内のraces.race_dateの最小値の前日」から
+# 毎回自動的に再開する。1回の実行では時間予算(既定3.5時間)を使い切ったら、
+# 処理中の日を最後まで終えた上で安全に終了する(日の途中で打ち切らない)。
+#
+# raise_on_block=Trueのセッションを使うため、403/429などアクセス制限の
+# 疑いがあるレスポンスを検知するとAccessBlockedErrorがそのまま呼び出し元
+# (main)まで伝播し、即座に処理を停止する。レースごとにconn.commit()して
+# いるため、停止時点までに取得できたデータは失われない。
+# ---------------------------------------------------------------------------
+
+BACKFILL_HISTORY_START = "20160901"
+
+
+def backfill_history(db_path, interval_sec=1.5, max_hours=3.5, start_boundary=BACKFILL_HISTORY_START):
+    conn = get_connection(db_path)
+    current_min = conn.execute("SELECT MIN(race_date) FROM races").fetchone()[0]
+    conn.close()
+
+    if current_min is None:
+        logger.error(
+            "racesテーブルが空のため、バックフィルの開始日(最古日の前日)を決定できません。"
+            "先に通常のスクレイプ(直近日)でデータを入れてください。"
+        )
+        return 0
+
+    if current_min <= start_boundary:
+        logger.info(
+            "過去データのバックフィルは既に開始境界(%s)に到達しています(現在の最古日: %s)。"
+            "これ以上遡る対象はありません。",
+            start_boundary, current_min,
+        )
+        return 0
+
+    date_obj = datetime.strptime(current_min, "%Y%m%d") - timedelta(days=1)
+    boundary_obj = datetime.strptime(start_boundary, "%Y%m%d")
+
+    deadline = time.monotonic() + max_hours * 3600
+    processed_days = 0
+
+    logger.info(
+        "過去データのバックフィル開始: %s から %s へ向けて遡って取得します(時間予算=%.1f時間、オッズは対象外)",
+        date_obj.strftime("%Y%m%d"), start_boundary, max_hours,
+    )
+
+    reached_boundary = False
+    while date_obj >= boundary_obj:
+        date_str = date_obj.strftime("%Y%m%d")
+        logger.info("=== バックフィル対象日: %s (今回%d日目) ===", date_str, processed_days + 1)
+
+        venues_count, races_count, status = scrape_day(
+            date_str, db_path, interval_sec=interval_sec, fetch_odds=False, raise_on_block=True,
+        )
+        processed_days += 1
+        logger.info(
+            "バックフィル: %s 完了 (会場数=%d, レース数=%d, status=%s)",
+            date_str, venues_count, races_count, status,
+        )
+
+        date_obj -= timedelta(days=1)
+
+        if date_obj < boundary_obj:
+            reached_boundary = True
+            break
+
+        if time.monotonic() >= deadline:
+            logger.info(
+                "今回の実行の時間予算(%.1f時間)に達したため終了します。処理済み: %d日 "
+                "(次回は%sから再開します)",
+                max_hours, processed_days, date_obj.strftime("%Y%m%d"),
+            )
+            break
+
+    if reached_boundary:
+        logger.info(
+            "開始境界(%s)まで到達しました。過去データのバックフィルは完了です(今回処理: %d日)。",
+            start_boundary, processed_days,
+        )
+
+    return processed_days
+
+
+# ---------------------------------------------------------------------------
 # メイン処理
 # ---------------------------------------------------------------------------
 
-def scrape_day(date_str, db_path, interval_sec=1.5):
-    session = PoliteSession(interval_sec=interval_sec)
+def scrape_day(date_str, db_path, interval_sec=1.5, fetch_odds=True, raise_on_block=False):
+    session = PoliteSession(interval_sec=interval_sec, raise_on_block=raise_on_block)
     conn = get_connection(db_path)
     started_at = datetime.now().isoformat(timespec="seconds")
     female_tobans = get_female_toban_set(conn)
@@ -1119,10 +1227,14 @@ def scrape_day(date_str, db_path, interval_sec=1.5):
             # 締切時オッズ(全7舟券種)。レースが終了しているため既に確定済みの値であり、
             # リアルタイム性を気にする必要はない。1レースあたり5ページ追加で
             # リクエストするため、日次取得の所要時間が大きく伸びる点に注意。
-            odds_rows = fetch_race_odds(session, jcd, rno, date_str)
-            if odds_rows:
-                odds_fetched_at = datetime.now().isoformat(timespec="seconds")
-                save_odds(conn, date_str, jcd, venue_name, rno, odds_rows, odds_fetched_at)
+            # fetch_odds=False(過去日付の一括バックフィル向け)の場合はスキップし、
+            # リクエスト数を1レースあたり2件(出走表+結果)に抑える。
+            odds_rows = []
+            if fetch_odds:
+                odds_rows = fetch_race_odds(session, jcd, rno, date_str)
+                if odds_rows:
+                    odds_fetched_at = datetime.now().isoformat(timespec="seconds")
+                    save_odds(conn, date_str, jcd, venue_name, rno, odds_rows, odds_fetched_at)
 
             conn.commit()
             races_count += 1
@@ -1262,6 +1374,20 @@ def main():
         help="--backfill-odds使用時、1回の実行で処理するレース数の上限。"
              "省略時は未補完分をすべて処理する。",
     )
+    parser.add_argument(
+        "--backfill-history", action="store_true",
+        help="DB内の最古のrace_dateより前の日を、開始境界(既定%s)まで1日ずつ"
+             "遡ってraces/entries/results/payoutsのみ取得する(オッズは対象外)。"
+             "他の取得は行わない。" % BACKFILL_HISTORY_START,
+    )
+    parser.add_argument(
+        "--backfill-history-hours", type=float, default=3.5,
+        help="--backfill-history使用時、1回の実行に使う時間予算(時間)。既定3.5時間。",
+    )
+    parser.add_argument(
+        "--backfill-history-start", default=BACKFILL_HISTORY_START,
+        help="--backfill-history使用時に遡る開始境界日(YYYYMMDD)。既定は%(default)s。",
+    )
     args = parser.parse_args()
 
     if args.date:
@@ -1294,6 +1420,23 @@ def main():
     if args.backfill_odds:
         logger.info("オッズ補完開始: db=%s limit=%s", args.db, args.backfill_odds_limit)
         backfill_odds(args.db, interval_sec=args.interval, limit=args.backfill_odds_limit)
+        return
+
+    if args.backfill_history:
+        logger.info(
+            "過去データのバックフィル開始: db=%s hours=%.1f start=%s",
+            args.db, args.backfill_history_hours, args.backfill_history_start,
+        )
+        try:
+            backfill_history(
+                args.db, interval_sec=args.interval,
+                max_hours=args.backfill_history_hours, start_boundary=args.backfill_history_start,
+            )
+        except AccessBlockedError as exc:
+            logger.error(
+                "アクセス制限(403/429)の疑いを検知したため、バックフィルを即座に停止しました: %s", exc
+            )
+            sys.exit(3)
         return
 
     if args.entries_only:

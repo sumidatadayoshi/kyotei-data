@@ -1,0 +1,104 @@
+name: Backfill History
+
+on:
+  schedule:
+    # 毎日 UTC 16:00 = 日本時間 翌1:00頃。daily-scrape.yml(UTC 18:37発火)/
+    # scrape-watchdog.yml(UTC 22:47発火)/backfill-odds.yml(UTC 23:10発火)より
+    # 前に置き、concurrency groupの待機列の先頭でこのジョブが動くようにしている。
+    # 時間予算(既定3.5時間)+マージ処理を終えても、daily-scrape.ymlの発火まで
+    # 十分な余裕がある。
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "1回の実行に使う時間予算(時間)"
+        required: false
+        default: "3.5"
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: boatrace-daily-scrape
+  cancel-in-progress: false
+
+jobs:
+  backfill-history:
+    runs-on: ubuntu-latest
+    # 時間予算(既定3.5時間)を使い切っても、処理中の日を最後まで終えてから
+    # 終了するため多少超過し得る。そのオーバーヘッド+マージ/pushの時間を
+    # 見込んで余裕を持たせているが、GitHub Actionsの1ジョブ上限(6時間)には
+    # 収まるようにしている。
+    timeout-minutes: 270
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backfill past races (races/entries/results/payouts, no odds)
+        # 速度より安全性を優先し、間隔短縮や並列化は行わない(--interval 1.5を維持)。
+        # 403/429などアクセス制限の疑いを検知した場合、boatrace_scraper.pyは
+        # 即座に処理を停止しexit code 3で終了する。ここでジョブ自体を失敗
+        # 扱いにはせず(それまでに取得できた分のコミット/pushとIssue通知を
+        # 後続ステップで必ず行うため)、終了コードだけ記録して続行する。
+        id: backfill
+        env:
+          HOURS: ${{ github.event.inputs.hours || '3.5' }}
+        run: |
+          set +e
+          python boatrace_scraper.py --backfill-history --backfill-history-hours "$HOURS" --interval 1.5
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Merge onto latest main and push
+        # data/boatrace.dbはバイナリのため、他のワークフロー(daily-scrape.yml/
+        # scrape-watchdog.yml/backfill-odds.yml)が実行中にpushしていると
+        # git rebase/mergeが解消不能なコンフリクトになる(backfill-odds.yml参照)。
+        # バックフィルは1回の実行が数時間かかり発生しやすいため、「pushの直前に
+        # 最新化し、今回追加した行だけをSQLレベルで再適用する」ことでバイナリの
+        # コンフリクトを避ける。アクセス制限検知等で途中停止した場合でも、
+        # そこまでに取得できた分は必ず保存する(if: always())。
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cp data/boatrace.db /tmp/backfilled.db
+          git fetch origin main
+          git reset --hard origin/main
+          python merge_history_tables.py /tmp/backfilled.db data/boatrace.db
+          git add data/boatrace.db
+          if git diff --cached --quiet; then
+            echo "No history changes to commit."
+          else
+            git commit -m "chore: backfill history ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            git push
+          fi
+
+      - name: Open issue if access was blocked
+        if: steps.backfill.outputs.exit_code == '3'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create \
+            --title "過去データバックフィル: アクセス制限(403/429)の疑いを検知して停止しました" \
+            --body "backfill-history.yml の実行中に、公式サイトから403または429相当のレスポンスが返り、処理を即座に停止しました。それまでに取得できた分はコミット済みです。スケジュール実行は次回も自動的に動きますが、原因(アクセス制限)が解消していない場合は同じ結果を繰り返す可能性があります。手動での確認をお願いします。 [実行ログ](${RUN_URL})"
+
+      - name: Open issue on unexpected failure
+        if: steps.backfill.outputs.exit_code != '' && steps.backfill.outputs.exit_code != '0' && steps.backfill.outputs.exit_code != '3'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXIT_CODE: ${{ steps.backfill.outputs.exit_code }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create \
+            --title "過去データバックフィル: 想定外のエラーで終了しました (exit code ${EXIT_CODE})" \
+            --body "backfill-history.yml の実行が想定外のエラー(exit code ${EXIT_CODE})で終了しました。それまでに取得できた分はコミット済みです。実行ログを確認してください。 [実行ログ](${RUN_URL})"
