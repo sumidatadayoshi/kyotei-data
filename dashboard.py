@@ -793,6 +793,94 @@ else:
     st.write("**累計収支の推移**")
     st.line_chart(chart_df.set_index("日付")[["累計収支"]])
 
+# ---------------------------------------------------------------------------
+# 🎢 ①②条件×重み付け買い(1-2:10,000円 / 1-3:5,000円) 日次投資額・損益
+#
+# 「イン逃げ狙い目レース分析」と同じ①②条件（イン逃げ率80%以上・逃し率50%以上）
+# に合致したレースのみを対象に、2連単「1-2」に10,000円、「1-3」に5,000円
+# （1-4は買わない、1レースあたり合計15,000円）を賭け続けた場合の、日ごとの
+# 投資額・払戻額と累計損益の推移を表示する。
+# ---------------------------------------------------------------------------
+st.subheader("🎢 ①②条件×重み付け買い(1-2:10,000円 / 1-3:5,000円) 日次投資額・損益")
+st.caption(
+    "①②の条件に合致したレースのみを対象に、2連単「1-2」に10,000円、「1-3」に"
+    "5,000円（1-4は買わない、1レースあたり合計15,000円）を賭け続けた場合の、"
+    "日ごとの投資額・払戻額（棒グラフ）と累計損益の推移（折れ線グラフ）です。"
+)
+
+PLAY_BET_WEIGHTS = {"1-2": 10000, "1-3": 5000}
+PLAY_TOTAL_BET_PER_RACE = sum(PLAY_BET_WEIGHTS.values())
+
+if c1_stats is None:
+    st.info("分析に必要なデータがまだありません。")
+else:
+    play_candidates = find_qualifying_races(entries_filtered, c1_stats, c2_stats)
+
+    if play_candidates.empty:
+        st.info("条件に合致するレースがないため、集計できません。")
+    else:
+        payouts_2tan_play = load_df(
+            "SELECT race_date, jcd, rno, combination, payout FROM payouts WHERE bet_type = '2連単'"
+        )
+        play_concluded = play_candidates.merge(
+            payouts_2tan_play, on=["race_date", "jcd", "rno"], how="inner"
+        )
+
+        if play_concluded.empty:
+            st.info("条件に合致したレースの中に、結果が判明しているものがまだありません。")
+        else:
+            def play_return(row):
+                weight = PLAY_BET_WEIGHTS.get(row["combination"])
+                if weight is None:
+                    return 0
+                return row["payout"] * (weight / 100)
+
+            play_concluded = play_concluded.copy()
+            play_concluded["return"] = play_concluded.apply(play_return, axis=1)
+            play_concluded["hit"] = play_concluded["combination"].isin(PLAY_BET_WEIGHTS)
+
+            play_daily = play_concluded.groupby("race_date").agg(
+                レース数=("combination", "size"), 払戻額=("return", "sum"), 的中数=("hit", "sum")
+            )
+            play_daily["投資額"] = play_daily["レース数"] * PLAY_TOTAL_BET_PER_RACE
+            play_daily["払戻額"] = play_daily["払戻額"].astype(int)
+            play_daily["収支"] = play_daily["払戻額"] - play_daily["投資額"]
+            play_daily = play_daily.sort_index()
+            play_daily["累計収支"] = play_daily["収支"].cumsum()
+
+            total_races_play = len(play_concluded)
+            total_hits_play = int(play_concluded["hit"].sum())
+            total_stake_play = total_races_play * PLAY_TOTAL_BET_PER_RACE
+            total_return_play = int(play_concluded["return"].sum())
+            recovery_rate_play = (
+                (total_return_play / total_stake_play * 100) if total_stake_play > 0 else 0.0
+            )
+            hit_rate_play = (total_hits_play / total_races_play * 100) if total_races_play > 0 else 0.0
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("対象レース数", f"{total_races_play}件")
+            m2.metric("的中回数", f"{total_hits_play}回")
+            m3.metric("的中率", f"{hit_rate_play:.1f}%")
+            m4.metric("回収率", f"{recovery_rate_play:.1f}%")
+            st.caption(
+                f"賭け金合計: {total_stake_play:,}円 / 払戻金合計: {total_return_play:,}円 / "
+                f"通算損益: {total_return_play - total_stake_play:,}円"
+            )
+
+            play_chart_df = play_daily.reset_index().rename(columns={"race_date": "日付"})
+            play_chart_df["日付"] = play_chart_df["日付"].apply(fmt_date)
+
+            st.write("**(1) 日ごとの投資額・払戻額**")
+            st.bar_chart(play_chart_df.set_index("日付")[["投資額", "払戻額"]])
+
+            st.write("**(2) 累計損益の推移**")
+            st.line_chart(play_chart_df.set_index("日付")[["累計収支"]])
+
+            st.dataframe(
+                play_chart_df[["日付", "レース数", "投資額", "払戻額", "収支", "累計収支"]],
+                hide_index=True, use_container_width=True,
+            )
+
 st.divider()
 
 # ---------------------------------------------------------------------------
