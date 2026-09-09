@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: boatrace-daily-scrape
@@ -55,17 +56,48 @@ jobs:
         # 実際発生した問題と同種)。バックフィルは1回の実行が数十分かかり
         # 発生しやすいため、「pushの直前に最新化し、今回追加したoddsの行だけを
         # SQLレベルで再適用する」ことでバイナリのコンフリクトを避ける。
+        # concurrency groupはActions起動のジョブ同士しか直列化しないため、
+        # ローカルからの直接pushなどとは依然競合しうる。fetch→reset→SQL再適用→
+        # pushを数回リトライし、それでも失敗したら後続ステップでIssueを作る。
+        id: push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           cp data/boatrace.db /tmp/backfilled.db
-          git fetch origin main
-          git reset --hard origin/main
-          python merge_odds_table.py /tmp/backfilled.db data/boatrace.db
-          git add data/boatrace.db
-          if git diff --cached --quiet; then
-            echo "No odds changes to commit."
-          else
+
+          max_attempts=5
+          attempt=1
+          push_failed=false
+          while :; do
+            git fetch origin main
+            git reset --hard origin/main
+            python merge_odds_table.py /tmp/backfilled.db data/boatrace.db
+            git add data/boatrace.db
+            if git diff --cached --quiet; then
+              echo "No odds changes to commit."
+              break
+            fi
             git commit -m "chore: backfill odds ($(date -u +'%Y-%m-%d %H:%M UTC'))"
-            git push
-          fi
+            if git push; then
+              break
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "push failed after $attempt attempts"
+              push_failed=true
+              break
+            fi
+            echo "push failed (attempt $attempt/$max_attempts), retrying..."
+            attempt=$((attempt + 1))
+            sleep $((attempt * 10))
+          done
+          echo "push_failed=$push_failed" >> "$GITHUB_OUTPUT"
+
+      - name: Open issue if push kept failing
+        if: steps.push.outputs.push_failed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create \
+            --title "オッズバックフィル: pushが繰り返し失敗しました" \
+            --body "backfill-odds.yml でfetch→reset→マージ→pushを複数回リトライしましたが、pushが成功しませんでした。取得済みデータはランナー上のコミットに残っていますが、リモートには反映されていません。手動での確認をお願いします。 [実行ログ](${RUN_URL})"

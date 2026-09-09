@@ -83,21 +83,52 @@ jobs:
         # 最新化し、今回追加した行だけをSQLレベルで再適用する」ことでバイナリの
         # コンフリクトを避ける。アクセス制限検知等で途中停止した場合でも、
         # そこまでに取得できた分は必ず保存する(if: always())。
+        # concurrency groupはActions起動のジョブ同士しか直列化しないため、
+        # ローカルからの直接pushなどとは依然競合しうる。fetch→reset→SQL再適用→
+        # pushを数回リトライし、それでも失敗したら後続ステップでIssueを作る。
+        id: push
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           cp data/boatrace.db /tmp/backfilled.db
-          git fetch origin main
-          git reset --hard origin/main
-          python merge_history_tables.py /tmp/backfilled.db data/boatrace.db
-          git add data/boatrace.db
-          if git diff --cached --quiet; then
-            echo "No history changes to commit."
-          else
+
+          max_attempts=5
+          attempt=1
+          push_failed=false
+          while :; do
+            git fetch origin main
+            git reset --hard origin/main
+            python merge_history_tables.py /tmp/backfilled.db data/boatrace.db
+            git add data/boatrace.db
+            if git diff --cached --quiet; then
+              echo "No history changes to commit."
+              break
+            fi
             git commit -m "chore: backfill history ($(date -u +'%Y-%m-%d %H:%M UTC'))"
-            git push
-          fi
+            if git push; then
+              break
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "push failed after $attempt attempts"
+              push_failed=true
+              break
+            fi
+            echo "push failed (attempt $attempt/$max_attempts), retrying..."
+            attempt=$((attempt + 1))
+            sleep $((attempt * 10))
+          done
+          echo "push_failed=$push_failed" >> "$GITHUB_OUTPUT"
+
+      - name: Open issue if push kept failing
+        if: steps.push.outputs.push_failed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create \
+            --title "過去データバックフィル: pushが繰り返し失敗しました" \
+            --body "backfill-history.yml でfetch→reset→マージ→pushを複数回リトライしましたが、pushが成功しませんでした。取得済みデータはランナー上のコミットに残っていますが、リモートには反映されていません。手動での確認をお願いします。 [実行ログ](${RUN_URL})"
 
       - name: Open issue if access was blocked
         if: steps.backfill.outputs.exit_code == '3'

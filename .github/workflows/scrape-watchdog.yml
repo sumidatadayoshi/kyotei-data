@@ -85,6 +85,10 @@ jobs:
         run: python check_scrape_status.py "$TARGET_DATE" >> "$GITHUB_OUTPUT"
 
       - name: Commit and push recovered data
+        # concurrency groupで他ワークフローとの同時実行は避けているが、
+        # ローカルからの直接pushなどとは依然競合しうる。fetch→rebase→pushを
+        # 数回リトライし、それでも失敗したら後続ステップでIssueを作る。
+        id: push
         if: steps.check.outputs.needs_retry == 'true'
         env:
           TARGET_DATE: ${{ steps.check.outputs.date }}
@@ -95,12 +99,40 @@ jobs:
           git add data/boatrace.db
           if git diff --cached --quiet; then
             echo "No data changes to commit."
+            echo "push_failed=false" >> "$GITHUB_OUTPUT"
           else
             git commit -m "chore: watchdog auto-recover $TARGET_DATE ($RECOVERED_STATUS)"
-            git fetch origin main
-            git rebase origin/main
-            git push
+
+            max_attempts=5
+            attempt=1
+            push_failed=false
+            while :; do
+              git fetch origin main
+              if git rebase origin/main && git push; then
+                break
+              fi
+              git rebase --abort 2>/dev/null || true
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "push failed after $attempt attempts"
+                push_failed=true
+                break
+              fi
+              echo "push failed (attempt $attempt/$max_attempts), retrying..."
+              attempt=$((attempt + 1))
+              sleep $((attempt * 10))
+            done
+            echo "push_failed=$push_failed" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Open issue if push kept failing
+        if: steps.push.outputs.push_failed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create \
+            --title "スクレイプ監視の自動復旧: pushが繰り返し失敗しました" \
+            --body "scrape-watchdog.yml でfetch→rebase→pushを複数回リトライしましたが、pushが成功しませんでした。復旧データはランナー上のコミットに残っていますが、リモートには反映されていません。手動での確認をお願いします。 [実行ログ](${RUN_URL})"
 
       - name: Open issue if recovery did not fully succeed
         if: steps.check.outputs.needs_retry == 'true' && steps.recheck.outputs.status != 'ok'
