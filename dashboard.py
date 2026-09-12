@@ -853,6 +853,7 @@ else:
                 play_daily["投資額"] > 0, play_daily["払戻額"] / play_daily["投資額"] * 100, 0.0
             ).round(1)
             play_daily = play_daily.sort_index()
+            play_daily["累計収支"] = play_daily["収支"].cumsum()
             play_daily["累計投資額"] = play_daily["投資額"].cumsum()
             play_daily["累計払戻額"] = play_daily["払戻額"].cumsum()
             play_daily["累計回収率(%)"] = np.where(
@@ -888,7 +889,7 @@ else:
             st.write("**(1) 日ごとの投資額・払戻額**")
             st.bar_chart(play_chart_df.set_index("日付")[["投資額", "払戻額"]])
 
-            # --- (2) 累計回収率の推移: 買い方ごとの戦略を色分けして1つのグラフに重ねる ---
+            # --- (2) 累計損益の推移: 買い方ごとの戦略を色分けして1つのグラフに重ねる ---
             # 賭け金の規模を揃えて比較できるよう、どの戦略も1レースあたり合計
             # PLAY_TOTAL_BET_PER_RACE(1,500円)を賭けたと仮定する。
             STRATEGY_COLORS = {
@@ -907,7 +908,7 @@ else:
 
             # 戦略1: 2連単 1-2:1,000円 + 1-3:500円(既存の買い方をそのまま流用)
             mix_daily = play_daily.reset_index().rename(columns={"race_date": "日付_raw"})[
-                ["日付_raw", "レース数", "投資額", "払戻額", "回収率(%)", "累計回収率(%)"]
+                ["日付_raw", "レース数", "投資額", "払戻額", "回収率(%)", "累計収支", "累計回収率(%)"]
             ]
             mix_daily["戦略"] = "2連単 1-2:1,000円+1-3:500円"
             strategy_daily_frames.append(mix_daily)
@@ -925,12 +926,14 @@ else:
                 )
                 tansho_daily["投資額"] = tansho_daily["レース数"] * PLAY_TOTAL_BET_PER_RACE
                 tansho_daily["払戻額"] = tansho_daily["払戻額"].astype(int)
+                tansho_daily["収支"] = tansho_daily["払戻額"] - tansho_daily["投資額"]
                 tansho_daily["回収率(%)"] = np.where(
                     tansho_daily["投資額"] > 0,
                     tansho_daily["払戻額"] / tansho_daily["投資額"] * 100,
                     0.0,
                 ).round(1)
                 tansho_daily = tansho_daily.sort_index()
+                tansho_daily["累計収支"] = tansho_daily["収支"].cumsum()
                 tansho_daily["累計投資額"] = tansho_daily["投資額"].cumsum()
                 tansho_daily["累計払戻額"] = tansho_daily["払戻額"].cumsum()
                 tansho_daily["累計回収率(%)"] = np.where(
@@ -942,7 +945,10 @@ else:
                 tansho_daily["戦略"] = "単勝1(1号艇の単勝)"
                 strategy_daily_frames.append(
                     tansho_daily[
-                        ["日付_raw", "レース数", "投資額", "払戻額", "回収率(%)", "累計回収率(%)", "戦略"]
+                        [
+                            "日付_raw", "レース数", "投資額", "払戻額", "回収率(%)",
+                            "累計収支", "累計回収率(%)", "戦略",
+                        ]
                     ]
                 )
 
@@ -963,7 +969,7 @@ else:
             date_order = [fmt_date(d) for d in all_dates_sorted]
             highlight_dates = [fmt_date(d) for d in all_dates_sorted if d in sg_g1_dates]
 
-            st.write("**(2) 累計回収率の推移(買い方ごとに色分け)**")
+            st.write("**(2) 累計損益の推移(買い方ごとに色分け)**")
             st.caption(
                 "背景が薄い赤色の日は、その日にSG・G1のレースが開催されていたことを示します。"
                 "凡例の色は買い方(戦略)ごとの折れ線に対応しています。"
@@ -978,7 +984,7 @@ else:
                 .mark_line(point=True)
                 .encode(
                     x=alt.X("日付:O", sort=date_order, title="日付"),
-                    y=alt.Y("累計回収率(%):Q", title="累計回収率(%)"),
+                    y=alt.Y("累計収支:Q", title="累計収支"),
                     color=alt.Color(
                         "戦略:N",
                         title="買い方",
@@ -987,7 +993,7 @@ else:
                             range=list(STRATEGY_COLORS.values()),
                         ),
                     ),
-                    tooltip=["日付", "戦略", "累計回収率(%)"],
+                    tooltip=["日付", "戦略", "累計収支", "累計回収率(%)"],
                 )
             )
             st.altair_chart(
@@ -996,7 +1002,9 @@ else:
             )
 
             st.dataframe(
-                play_chart_df[["日付", "レース数", "投資額", "払戻額", "回収率(%)", "累計回収率(%)"]],
+                play_chart_df[
+                    ["日付", "レース数", "投資額", "払戻額", "回収率(%)", "累計収支", "累計回収率(%)"]
+                ],
                 hide_index=True, use_container_width=True,
             )
 
