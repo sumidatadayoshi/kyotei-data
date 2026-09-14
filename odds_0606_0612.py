@@ -1,9 +1,9 @@
 """
-①②条件(1号艇イン逃げ率80%以上・2号艇逃し率50%以上)に合致した過去レースのうち、
-実際に1号艇が1着だったレースだけを対象に、2〜6号艇それぞれの着順(2着〜6着・
-失格等)の分布を件数・割合で比較する。
+①②条件合致レースのうち、2連単「1-2」「1-3」がそれぞれ的中した場合の
+払戻オッズ(倍率 = payout/100)について、2026-06-06〜06-12の期間と
+それ以外の期間(通常期間)とで平均値・中央値を比較する。
 
-rank_distribution_when_escaped.pyと同一の判定ロジックに、5号艇・6号艇を追加。
+判定ロジックはblock_bootstrap_weighted_12_13.pyと同一。
 """
 import sqlite3
 from pathlib import Path
@@ -15,6 +15,9 @@ DB_PATH = Path(__file__).parent / "data" / "boatrace.db"
 SAMPLE_SIZE_WARNING_THRESHOLD = 10
 INN_NIGE_RATE_THRESHOLD = 0.8
 NIGASHI_RATE_THRESHOLD = 0.5
+
+PERIOD_START = "20260606"
+PERIOD_END = "20260612"
 
 
 def compute_racer_rate_stats(entries_all, results_all):
@@ -36,7 +39,7 @@ def compute_racer_rate_stats(entries_all, results_all):
     )
     c2_stats["rate"] = c2_stats["nigasare"] / c2_stats["starts"]
 
-    return c1_stats, c2_stats, waku1_rank
+    return c1_stats, c2_stats
 
 
 def find_qualifying_races(entries_df, c1_stats, c2_stats):
@@ -54,11 +57,11 @@ def find_qualifying_races(entries_df, c1_stats, c2_stats):
     )
 
     entries1 = entries_df[entries_df["waku"] == 1][
-        ["race_date", "jcd", "rno", "toban", "racer_name", "venue_name"]
-    ].rename(columns={"toban": "toban1", "racer_name": "racer1_name"})
+        ["race_date", "jcd", "rno", "toban"]
+    ].rename(columns={"toban": "toban1"})
     entries2 = entries_df[entries_df["waku"] == 2][
-        ["race_date", "jcd", "rno", "toban", "racer_name"]
-    ].rename(columns={"toban": "toban2", "racer_name": "racer2_name"})
+        ["race_date", "jcd", "rno", "toban"]
+    ].rename(columns={"toban": "toban2"})
     race_pairs = entries1.merge(entries2, on=["race_date", "jcd", "rno"], how="inner")
 
     return race_pairs[
@@ -67,49 +70,32 @@ def find_qualifying_races(entries_df, c1_stats, c2_stats):
 
 
 conn = sqlite3.connect(DB_PATH)
-entries_all = pd.read_sql_query(
-    "SELECT race_date, jcd, rno, waku, toban, racer_name, gender, venue_name FROM entries", conn
-)
+entries_all = pd.read_sql_query("SELECT race_date, jcd, rno, waku, toban FROM entries", conn)
 results_all = pd.read_sql_query("SELECT race_date, jcd, rno, waku, rank FROM results", conn)
 payouts_2tan = pd.read_sql_query(
     "SELECT race_date, jcd, rno, combination, payout FROM payouts WHERE bet_type = '2連単'", conn
 )
 
-c1_stats, c2_stats, waku1_rank = compute_racer_rate_stats(entries_all, results_all)
+c1_stats, c2_stats = compute_racer_rate_stats(entries_all, results_all)
 candidates = find_qualifying_races(entries_all, c1_stats, c2_stats)
-
 concluded = candidates.merge(payouts_2tan, on=["race_date", "jcd", "rno"], how="inner")
-concluded = concluded.merge(waku1_rank, on=["race_date", "jcd", "rno"], how="inner")
+concluded["odds"] = concluded["payout"] / 100
 
-escaped = concluded[concluded["waku1_rank"] == "1"][["race_date", "jcd", "rno"]].drop_duplicates()
-total = len(escaped)
+period_mask = (concluded["race_date"] >= PERIOD_START) & (concluded["race_date"] <= PERIOD_END)
 
-print(f"①②条件に合致し、かつ1号艇が実際に1着だったレース: {total}件\n")
+out = []
+for combo in ["1-2", "1-3"]:
+    sub = concluded[concluded["combination"] == combo]
+    period_odds = sub[period_mask]["odds"]
+    normal_odds = sub[~period_mask]["odds"]
+    out.append(f"■ 2連単「{combo}」的中時オッズ(倍率)")
+    out.append(f"  {PERIOD_START[:4]}-{PERIOD_START[4:6]}-{PERIOD_START[6:8]}〜"
+               f"{PERIOD_END[:4]}-{PERIOD_END[4:6]}-{PERIOD_END[6:8]}: "
+               f"的中{len(period_odds)}回 / 平均{period_odds.mean():.2f}倍 / 中央値{period_odds.median():.2f}倍")
+    out.append(f"  通常期間: 的中{len(normal_odds)}回 / 平均{normal_odds.mean():.2f}倍 / "
+               f"中央値{normal_odds.median():.2f}倍")
+    out.append("")
 
-TARGET_RANKS = ["2", "3", "4", "5", "6"]
-WAKUS = [2, 3, 4, 5, 6]
-
-waku_counts = {}
-for waku in WAKUS:
-    waku_results = results_all[results_all["waku"] == waku].merge(
-        escaped, on=["race_date", "jcd", "rno"], how="inner"
-    )
-    waku_counts[waku] = waku_results["rank"].value_counts()
-
-col_width = 16
-header = f"{'着順':<6}" + "".join(f"{str(w) + '号艇':>{col_width}}" for w in WAKUS)
-print(header)
-for r in TARGET_RANKS:
-    row = f"{r + '着':<6}"
-    for waku in WAKUS:
-        n = int(waku_counts[waku].get(r, 0))
-        pct = n / total * 100 if total > 0 else 0.0
-        row += f"{f'{n}件({pct:.1f}%)':>{col_width}}"
-    print(row)
-
-row = f"{'失格等':<6}"
-for waku in WAKUS:
-    known = sum(int(waku_counts[waku].get(r, 0)) for r in TARGET_RANKS)
-    other = total - known
-    row += f"{f'{other}件({other / total * 100:.1f}%)':>{col_width}}"
-print(row)
+text = "\n".join(out)
+print(text)
+Path(__file__).parent.joinpath("odds_0606_0612_output.txt").write_text(text, encoding="utf-8")

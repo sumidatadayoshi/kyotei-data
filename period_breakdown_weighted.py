@@ -15,7 +15,7 @@ import pandas as pd
 DB_PATH = Path(__file__).parent / "data" / "boatrace.db"
 PERIOD_DAYS = 5
 
-SAMPLE_SIZE_WARNING_THRESHOLD = 5
+SAMPLE_SIZE_WARNING_THRESHOLD = 10
 INN_NIGE_RATE_THRESHOLD = 0.8
 NIGASHI_RATE_THRESHOLD = 0.5
 

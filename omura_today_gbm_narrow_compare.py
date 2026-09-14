@@ -15,7 +15,7 @@ from sklearn.metrics import roc_auc_score
 
 DB_PATH = Path(__file__).parent / "data" / "boatrace.db"
 RANDOM_STATE = 42
-SAMPLE_SIZE_WARNING_THRESHOLD = 5
+SAMPLE_SIZE_WARNING_THRESHOLD = 10
 INN_NIGE_RATE_THRESHOLD = 0.8
 NIGASHI_RATE_THRESHOLD = 0.5
 TARGET_DATE = "20260909"

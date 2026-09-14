@@ -15,7 +15,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, accuracy_score
 
 DB_PATH = "data/boatrace.db"
-SAMPLE_SIZE_WARNING_THRESHOLD = 5
+SAMPLE_SIZE_WARNING_THRESHOLD = 10
 INN_NIGE_RATE_THRESHOLD = 0.8
 NIGASHI_RATE_THRESHOLD = 0.5
 

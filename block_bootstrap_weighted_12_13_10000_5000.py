@@ -1,26 +1,28 @@
 """
 ①②条件(1号艇イン逃げ率80%以上・2号艇逃し率50%以上)に合致した過去レースのみを
-対象に、2連単「1-2」に300円、「1-3」「1-4」にそれぞれ100円（1レースあたり合計
-500円）を賭け続けた場合について、対象データの最古日から5日ごとの期間に区切り、
-期間ごとの対象レース数・的中回数・回収率を表にする。
+対象に、2連単「1-2」に10,000円、「1-3」に5,000円（1レースあたり合計15,000円、
+1-4は買わない）を賭け続けた場合の回収率と、開催日×競艇場(jcd)単位のブロック
+ブートストラップによる95%信頼区間を計算する。
 
-period_breakdown_weighted.pyと同一内容で、BET_WEIGHTSのみ変更。
+判定ロジックはblock_bootstrap_1_2.py等と同一内容を複製。
 """
 import sqlite3
 from pathlib import Path
-from datetime import timedelta
 
+import numpy as np
 import pandas as pd
 
 DB_PATH = Path(__file__).parent / "data" / "boatrace.db"
-PERIOD_DAYS = 5
+N_RESAMPLES = 2000
+SEED = 42
 
 SAMPLE_SIZE_WARNING_THRESHOLD = 10
 INN_NIGE_RATE_THRESHOLD = 0.8
 NIGASHI_RATE_THRESHOLD = 0.5
 
-BET_WEIGHTS = {"1-2": 300, "1-3": 100, "1-4": 100}
-TOTAL_BET_PER_RACE = sum(BET_WEIGHTS.values())  # 500円
+# 買い目ごとの賭け金（円）。1-4は買わない。
+BET_WEIGHTS = {"1-2": 10000, "1-3": 5000}
+TOTAL_BET_PER_RACE = sum(BET_WEIGHTS.values())  # 300円
 
 
 def compute_racer_rate_stats(entries_all, results_all):
@@ -83,10 +85,15 @@ payouts_2tan = pd.read_sql_query(
 
 c1_stats, c2_stats, _ = compute_racer_rate_stats(entries_all, results_all)
 candidates = find_qualifying_races(entries_all, c1_stats, c2_stats)
+
+# ①②の条件に合致し、かつ結果（2連単payout）が判明しているレースのみが対象
 concluded = candidates.merge(payouts_2tan, on=["race_date", "jcd", "rno"], how="inner")
+total_races = len(concluded)
 
 
 def race_return(row):
+    """結果が1-2または1-3ならその点の払戻を、それ以外は0円を返す。
+    payoutテーブルの値は100円賭けた場合の払戻金なので、賭け金の倍率をかける。"""
     weight = BET_WEIGHTS.get(row["combination"])
     if weight is None:
         return 0
@@ -96,40 +103,51 @@ def race_return(row):
 concluded["return"] = concluded.apply(race_return, axis=1)
 concluded["hit"] = concluded["combination"].isin(BET_WEIGHTS).astype(int)
 
-concluded["date_dt"] = pd.to_datetime(concluded["race_date"], format="%Y%m%d")
-min_date = concluded["date_dt"].min()
-max_date = concluded["date_dt"].max()
+hit_count = int(concluded["hit"].sum())
+total_return = int(concluded["return"].sum())
+total_stake = total_races * TOTAL_BET_PER_RACE
+recovery_rate = (total_return / total_stake * 100) if total_stake > 0 else 0.0
+hit_rate = (hit_count / total_races * 100) if total_races > 0 else 0.0
 
-concluded["days_from_start"] = (concluded["date_dt"] - min_date).dt.days
-concluded["period_idx"] = concluded["days_from_start"] // PERIOD_DAYS
+print("買い目: 2連単 1-2(10,000円) + 1-3(5,000円) 、1レースあたり計15,000円（1-4は買わない）")
+print(f"対象レース数（①②条件に合致し結果判明済み）: {total_races}件")
+print(f"的中回数（1-2または1-3）: {hit_count}回")
+print(f"的中率: {hit_rate:.1f}%")
+print(f"回収率: {recovery_rate:.1f}%")
+print(f"賭け金合計: {total_stake:,}円 / 払戻金合計: {total_return:,}円 / "
+      f"通算損益: {total_return - total_stake:,}円")
 
-rows = []
-for period_idx, g in concluded.groupby("period_idx"):
-    period_start = min_date + timedelta(days=int(period_idx) * PERIOD_DAYS)
-    period_end = period_start + timedelta(days=PERIOD_DAYS - 1)
-    n = len(g)
-    hits = int(g["hit"].sum())
-    stake = n * TOTAL_BET_PER_RACE
-    ret = int(g["return"].sum())
-    rate = ret / stake * 100 if stake > 0 else 0.0
-    hit_rate = hits / n * 100 if n > 0 else 0.0
-    rows.append({
-        "期間": f"{period_start.strftime('%Y-%m-%d')}〜{min(period_end, max_date).strftime('%Y-%m-%d')}",
-        "対象レース数": n,
-        "的中回数": hits,
-        "的中率": f"{hit_rate:.1f}%",
-        "回収率": f"{rate:.1f}%",
-    })
+for combo, w in BET_WEIGHTS.items():
+    sub = concluded[concluded["combination"] == combo]
+    n_hit = len(sub)
+    ret = int(sub["payout"].sum() * (w / 100))
+    print(f"  内訳 {combo}（賭け金{w}円）: 的中{n_hit}回、払戻合計{ret:,}円")
 
-result_df = pd.DataFrame(rows)
+print()
 
-print("買い目: 2連単 1-2(300円) + 1-3(100円) + 1-4(100円) 、1レースあたり計500円")
-print(f"対象データの最古日: {min_date.strftime('%Y-%m-%d')} / 最新日: {max_date.strftime('%Y-%m-%d')}")
-print(f"{PERIOD_DAYS}日ごとの期間区切り\n")
-print(result_df.to_string(index=False))
+# --- 開催日×競艇場 単位のブロックブートストラップ ---
+# レースごとに賭け金合計(300円固定)・払戻金合計(上のreturn列)を求めたうえで、
+# race_date × jcd のブロック単位に集計してからリサンプリングする。
+block_key = concluded["race_date"].astype(str) + "_" + concluded["jcd"].astype(str)
+df = pd.DataFrame({
+    "block": block_key,
+    "return": concluded["return"].to_numpy(),
+})
+blocks = df.groupby("block").agg(n=("return", "size"), return_sum=("return", "sum"))
+n_blocks = len(blocks)
 
-total_n = len(concluded)
-total_hits = int(concluded["hit"].sum())
-total_stake = total_n * TOTAL_BET_PER_RACE
-total_ret = int(concluded["return"].sum())
-print(f"\n合計: {total_n}件 / 的中{total_hits}回 / 回収率{total_ret/total_stake*100:.1f}%")
+n_arr = blocks["n"].to_numpy()
+return_arr = blocks["return_sum"].to_numpy()
+
+rng = np.random.default_rng(SEED)
+idx = rng.integers(0, n_blocks, size=(N_RESAMPLES, n_blocks))
+resample_stake = n_arr[idx].sum(axis=1) * TOTAL_BET_PER_RACE
+resample_return = return_arr[idx].sum(axis=1)
+rates = np.where(resample_stake > 0, resample_return / resample_stake * 100, 0.0)
+
+lower, upper = np.percentile(rates, [2.5, 97.5])
+
+print(f"ブロック数（開催日×競艇場）: {n_blocks}")
+print(f"リサンプル回数: {N_RESAMPLES}, シード: {SEED}")
+print(f"95%信頼区間: {lower:.1f}% 〜 {upper:.1f}%")
+print(f"ブートストラップ分布の中央値: {np.median(rates):.1f}%")
