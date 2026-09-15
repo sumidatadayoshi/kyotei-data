@@ -20,9 +20,13 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import re
+
 import numpy as np
 import pandas as pd
 import streamlit as st
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.model_selection import GroupKFold
 
 DB_PATH = Path(__file__).parent / "data" / "boatrace.db"
 JST = ZoneInfo("Asia/Tokyo")
@@ -699,6 +703,351 @@ else:
 
             if total_races < SAMPLE_SIZE_WARNING_THRESHOLD:
                 st.warning("⚠️ 対象レース数(母数)が少なく、参考データ不足です。")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# 🧪 p1p2方式(並走比較・実験的機能)
+#
+# 上記の固定買い(1-2/1-3/1-4等)とは別に、①②条件に合致し実際に1号艇が
+# イン逃げしたレースについて、2〜6号艇の「2着になる確率」をモデルで予測し、
+# 確率が高い順に2艇を選んで
+#   pick①(予測1位) → 2連単「1-pick①」に200円
+#   pick②(予測2位) → 2連単「1-pick②」に100円
+# を賭ける「p1p2」方式を試験的に併走させる。既存の固定買いシミュレーターは
+# そのまま残し、比較のためにこちらを追加する。
+#
+# 重要(未来データのリーク対策):
+#   - course_win_rate_prior/course_starts_prior(コース別通算成績)は
+#     「そのレースより前の結果だけ」から計算する。
+#   - 過去実績の検証(バックテスト)は5分割のGroupKFold(レース単位でグループ化)
+#     によるOut-of-Fold予測を使う(同じレースが学習と評価の両方に混ざらない)。
+#     ただし同一期間内でのクロスバリデーションであり、本番同様に「過去データ
+#     のみで学習し未来を予測する」真のフォワードテストとは厳密には異なる点に
+#     注意。
+#   - 「本日のp1p2ピック」は、本日より前の全データだけで学習したモデルを使う。
+# ---------------------------------------------------------------------------
+st.header("🧪 p1p2方式(並走比較・実験的機能)")
+st.caption(
+    "①②の条件に合致し、実際に1号艇がイン逃げしたレースについて、2〜6号艇の"
+    "「2着になる確率」をモデル(HistGradientBoostingClassifier)で予測し、"
+    "予測確率が高い順に2艇を選んで pick①(200円)/pick②(100円) を"
+    "2連単「1-pick①」「1-pick②」に賭ける方式です。上記の固定買いシミュレーターと"
+    "並走させて比較するための実験的機能です。"
+)
+
+P1P2_STAKE1 = 200
+P1P2_STAKE2 = 100
+
+P1P2_CATEGORICAL_COLS = ["racer_class", "gender", "venue_name", "weather", "grade"]
+P1P2_BASE_NUMERIC_COLS = [
+    "waku", "age", "weight", "f_count", "l_count", "avg_st",
+    "national_win_rate", "national_2rate", "national_3rate",
+    "local_win_rate", "local_2rate", "local_3rate",
+    "motor_2rate", "motor_3rate", "boat_2rate", "boat_3rate",
+    "temperature", "wind_speed", "water_temp", "wave_height", "distance_m",
+    "course_win_rate_prior", "course_starts_prior",
+]
+P1P2_FEATURE_COLS = P1P2_BASE_NUMERIC_COLS + P1P2_CATEGORICAL_COLS
+
+
+@st.cache_data(show_spinner="p1p2用データを準備中...")
+def load_p1p2_base(cache_key):
+    """p1p2モデル用に、①②条件判定には使わない追加の特徴量列(選手成績・
+    気象条件等)を含めてentries/races/resultsを読み込み、is_2nd(2着かどうか)と
+    レースより前の実績だけを使うcourse_win_rate_prior/course_starts_priorを
+    付与する。cache_keyはentries件数など、データ更新でキャッシュを無効化する
+    ための値(データフレーム自体はハッシュ計算が重いので使わない)。"""
+    entries_p1p2 = load_df(
+        "SELECT race_date, jcd, rno, waku, toban, racer_class, gender, age, weight, "
+        "f_count, l_count, avg_st, national_win_rate, national_2rate, national_3rate, "
+        "local_win_rate, local_2rate, local_3rate, motor_2rate, motor_3rate, "
+        "boat_2rate, boat_3rate FROM entries"
+    )
+    races_p1p2 = load_df(
+        "SELECT race_date, jcd, rno, venue_name, weather, temperature, wind_speed, "
+        "water_temp, wave_height, distance, grade FROM races"
+    )
+    results_p1p2 = load_df("SELECT race_date, jcd, rno, waku, rank FROM results")
+
+    races_p1p2 = races_p1p2.copy()
+    races_p1p2["distance_m"] = races_p1p2["distance"].apply(
+        lambda s: float(re.sub(r"[^0-9.]", "", s)) if isinstance(s, str) and re.search(r"[0-9]", s) else np.nan
+    )
+
+    base = entries_p1p2.merge(races_p1p2, on=["race_date", "jcd", "rno"], how="inner")
+    base = base.merge(results_p1p2, on=["race_date", "jcd", "rno", "waku"], how="left")
+    base["is_win"] = (base["rank"] == "1").astype(int)
+    base["is_2nd"] = (base["rank"] == "2").astype(int)
+    base["race_key"] = base["race_date"].astype(str) + "_" + base["jcd"].astype(str) + "_" + base["rno"].astype(str)
+
+    day_stats = base[base["rank"].notna()].groupby(["toban", "waku", "race_date"]).agg(
+        day_starts=("is_win", "size"), day_wins=("is_win", "sum")
+    ).reset_index().sort_values(["toban", "waku", "race_date"])
+    day_stats["cum_starts_incl"] = day_stats.groupby(["toban", "waku"])["day_starts"].cumsum()
+    day_stats["cum_wins_incl"] = day_stats.groupby(["toban", "waku"])["day_wins"].cumsum()
+    day_stats["course_starts_prior"] = day_stats["cum_starts_incl"] - day_stats["day_starts"]
+    day_stats["course_wins_prior"] = day_stats["cum_wins_incl"] - day_stats["day_wins"]
+    day_stats["course_win_rate_prior"] = np.where(
+        day_stats["course_starts_prior"] > 0,
+        day_stats["course_wins_prior"] / day_stats["course_starts_prior"],
+        np.nan,
+    )
+    base = base.merge(
+        day_stats[["toban", "waku", "race_date", "course_win_rate_prior", "course_starts_prior"]],
+        on=["toban", "waku", "race_date"], how="left",
+    )
+
+    for col in P1P2_BASE_NUMERIC_COLS:
+        if col not in ("course_win_rate_prior", "course_starts_prior"):
+            base[col] = pd.to_numeric(base[col], errors="coerce")
+    for col in P1P2_CATEGORICAL_COLS:
+        base[col] = base[col].astype("category")
+
+    return base
+
+
+def build_narrow_keys(candidates_all, waku1_rank_df):
+    """①②条件に合致し、実際に1号艇がイン逃げしたレースのキー一覧を作る。"""
+    cand = candidates_all.merge(waku1_rank_df, on=["race_date", "jcd", "rno"], how="left")
+    return cand[cand["waku1_rank"] == "1"][["race_date", "jcd", "rno"]].drop_duplicates().reset_index(drop=True)
+
+
+@st.cache_data(show_spinner="p1p2モデルをバックテスト中(GroupKFold)...")
+def p1p2_backtest(cache_key, _base, _narrow_keys, _payouts_2tan):
+    """narrow_keys(①②条件×実際にイン逃げしたレース)を対象に、GroupKFold(5)の
+    Out-of-Fold予測でpick①②を決め、実際の2連単払戻でp1p2方式の的中率・回収率を
+    計算する。同じレースが学習と評価に混ざらないようレース単位でグループ化する。"""
+    narrow_mask = _base.merge(
+        _narrow_keys.assign(_n=1), on=["race_date", "jcd", "rno"], how="left"
+    )["_n"].notna().values
+    sub = _base[narrow_mask & _base["waku"].isin([2, 3, 4, 5, 6]).values & _base["rank"].notna().values].copy()
+
+    if len(sub) < 50:
+        return None
+
+    groups = sub["race_key"].values
+    gkf = GroupKFold(n_splits=5)
+    sub["proba"] = np.nan
+    for tr_idx, te_idx in gkf.split(sub, sub["is_2nd"], groups=groups):
+        model = HistGradientBoostingClassifier(
+            categorical_features="from_dtype", max_iter=300, learning_rate=0.05,
+            early_stopping=True, validation_fraction=0.1, n_iter_no_change=20, random_state=42,
+        )
+        model.fit(sub.iloc[tr_idx][P1P2_FEATURE_COLS], sub.iloc[tr_idx]["is_2nd"])
+        sub.iloc[te_idx, sub.columns.get_loc("proba")] = model.predict_proba(
+            sub.iloc[te_idx][P1P2_FEATURE_COLS]
+        )[:, 1]
+
+    def top2(g):
+        g2 = g.sort_values("proba", ascending=False)
+        return pd.Series({"pick1": int(g2.iloc[0]["waku"]), "pick2": int(g2.iloc[1]["waku"])})
+
+    top2_keys = sub.groupby(["race_date", "jcd", "rno"]).apply(top2, include_groups=False).reset_index()
+
+    bt = _narrow_keys.merge(top2_keys, on=["race_date", "jcd", "rno"], how="inner")
+    for w in [2, 3, 4, 5, 6]:
+        pay_w = _payouts_2tan[_payouts_2tan["combination"] == f"1-{w}"][
+            ["race_date", "jcd", "rno", "payout"]
+        ].rename(columns={"payout": f"pay_{w}"})
+        bt = bt.merge(pay_w, on=["race_date", "jcd", "rno"], how="left")
+        bt[f"pay_{w}"] = bt[f"pay_{w}"].fillna(0)
+
+    def pay_of(row, w):
+        return row[f"pay_{int(w)}"]
+
+    bt["pay1"] = bt.apply(lambda r: pay_of(r, r["pick1"]), axis=1)
+    bt["pay2"] = bt.apply(lambda r: pay_of(r, r["pick2"]), axis=1)
+    bt["ret"] = bt["pay1"] * P1P2_STAKE1 / 100 + bt["pay2"] * P1P2_STAKE2 / 100
+    bt["stake"] = P1P2_STAKE1 + P1P2_STAKE2
+    bt["hit"] = (bt["pay1"] > 0) | (bt["pay2"] > 0)
+    return bt
+
+
+def bb_recovery_p1p2(df, seed=42, n_boot=2000):
+    """開催日×場単位のブロックブートストラップで回収率の95%信頼区間を求める
+    (既存のbootstrap_recovery_rate_ci関数は100円固定買い前提のため、
+    pick①②で賭け金が異なるp1p2用に別関数として用意する)。
+    戻り値: (point, lower, upper, sim) — simはn_boot個の回収率(%)の配列
+    (ヒストグラム表示用)。"""
+    d = df.copy()
+    d["block"] = d["race_date"].astype(str) + "_" + d["jcd"].astype(str)
+    blocks = d.groupby("block").agg(stake_sum=("stake", "sum"), return_sum=("ret", "sum"))
+    point = blocks["return_sum"].sum() / blocks["stake_sum"].sum() * 100
+    rng = np.random.default_rng(seed)
+    bs = blocks["stake_sum"].to_numpy()
+    br = blocks["return_sum"].to_numpy()
+    nb = len(blocks)
+    idx = rng.integers(0, nb, size=(n_boot, nb))
+    sim = br[idx].sum(axis=1) / bs[idx].sum(axis=1) * 100
+    lo, hi = np.percentile(sim, [2.5, 97.5])
+    return point, lo, hi, sim
+
+
+@st.cache_resource(show_spinner="p1p2の本日用モデルを学習中...")
+def train_p1p2_live_model(cache_key, _train_df):
+    """本日の買い目提示用に、本日より前の全データだけでモデルを学習する
+    (本番運用と同じ考え方: 未来のデータは一切使わない)。"""
+    model = HistGradientBoostingClassifier(
+        categorical_features="from_dtype", max_iter=300, learning_rate=0.05,
+        early_stopping=True, validation_fraction=0.1, n_iter_no_change=20, random_state=42,
+    )
+    model.fit(_train_df[P1P2_FEATURE_COLS], _train_df["is_2nd"])
+    return model
+
+
+if c1_stats is None:
+    st.info("分析に必要なデータがまだありません。")
+else:
+    p1p2_cache_key = (len(entries_all), len(results_all), today_str)
+    p1p2_base = load_p1p2_base(p1p2_cache_key)
+    payouts_2tan_p1p2 = load_df(
+        "SELECT race_date, jcd, rno, combination, payout FROM payouts WHERE bet_type = '2連単'"
+    )
+
+    # --- 本日のp1p2ピック ---
+    st.subheader("📍 本日のp1p2ピック")
+    if today_entries.empty:
+        st.info("本日の出走表データがまだありません。")
+    else:
+        today_qualifying = find_qualifying_races(today_entries, c1_stats, c2_stats)
+        if today_qualifying.empty:
+            st.info("本日は①②条件に合うレースがありません。")
+        else:
+            train_df = p1p2_base[(p1p2_base["race_date"] < today_str) & p1p2_base["rank"].notna()]
+            if len(train_df) < 50:
+                st.info("モデル学習に使う過去データがまだ十分にありません。")
+            else:
+                live_model = train_p1p2_live_model((len(train_df), today_str), train_df)
+                today_sub = p1p2_base[
+                    (p1p2_base["race_date"] == today_str) & p1p2_base["waku"].isin([2, 3, 4, 5, 6])
+                ].merge(
+                    today_qualifying[["race_date", "jcd", "rno"]],
+                    on=["race_date", "jcd", "rno"], how="inner",
+                ).copy()
+                if today_sub.empty:
+                    st.info("本日の対象レースについて、予測に必要な特徴量データがまだ揃っていません。")
+                else:
+                    today_sub["proba"] = live_model.predict_proba(today_sub[P1P2_FEATURE_COLS])[:, 1]
+
+                    def top2_live(g):
+                        g2 = g.sort_values("proba", ascending=False)
+                        return pd.Series({
+                            "pick1": int(g2.iloc[0]["waku"]), "pick1_proba": g2.iloc[0]["proba"],
+                            "pick2": int(g2.iloc[1]["waku"]), "pick2_proba": g2.iloc[1]["proba"],
+                        })
+
+                    live_picks = today_sub.groupby(["race_date", "jcd", "rno"]).apply(
+                        top2_live, include_groups=False
+                    ).reset_index()
+                    live_picks = live_picks.merge(
+                        race_meta[["race_date", "jcd", "rno", "grade"]],
+                        on=["race_date", "jcd", "rno"], how="left",
+                    )
+                    live_picks = live_picks.merge(
+                        today_entries[["race_date", "jcd", "rno", "venue_name"]].drop_duplicates(),
+                        on=["race_date", "jcd", "rno"], how="left",
+                    )
+                    live_picks["グレード"] = live_picks["grade"].fillna("不明")
+                    live_picks["pick①"] = (
+                        live_picks["pick1"].astype(str) + "号艇(200円) "
+                        + (live_picks["pick1_proba"] * 100).round(1).astype(str) + "%"
+                    )
+                    live_picks["pick②"] = (
+                        live_picks["pick2"].astype(str) + "号艇(100円) "
+                        + (live_picks["pick2_proba"] * 100).round(1).astype(str) + "%"
+                    )
+                    display_live = live_picks.rename(
+                        columns={"venue_name": "場", "rno": "R"}
+                    )[["場", "R", "グレード", "pick①", "pick②"]]
+                    st.dataframe(display_live, hide_index=True, use_container_width=True)
+                    st.caption(
+                        "本日より前の全データだけで学習したモデルによる予測です。"
+                        "①②条件に合致したレースのうち、2〜6号艇で「2着になる確率」が"
+                        "高い順に2艇を選び、2連単「1-pick①」に200円、「1-pick②」に100円を"
+                        "賭ける想定です。予測であり結果を保証するものではありません。"
+                    )
+
+    # --- p1p2の過去実績バックテスト ---
+    st.subheader("📊 p1p2方式の過去実績(GroupKFold・Out-of-Fold検証)")
+    all_qualifying_p1p2 = find_qualifying_races(entries_filtered, c1_stats, c2_stats)
+    if all_qualifying_p1p2.empty:
+        st.info("条件に合致するレースがないため、集計できません。")
+    else:
+        narrow_keys_p1p2 = build_narrow_keys(all_qualifying_p1p2, waku1_rank)
+        if narrow_keys_p1p2.empty:
+            st.info("該当レースで実際に1号艇が逃げた事例がまだありません。")
+        else:
+            bt_cache_key = (len(narrow_keys_p1p2), len(p1p2_base))
+            bt_result = p1p2_backtest(bt_cache_key, p1p2_base, narrow_keys_p1p2, payouts_2tan_p1p2)
+            if bt_result is None or bt_result.empty:
+                st.info("バックテストに使えるデータがまだ十分にありません。")
+            else:
+                n_races_bt = len(bt_result)
+                hit_rate_bt = bt_result["hit"].mean() * 100
+                point, lo, hi, boot_rates_p1p2 = bb_recovery_p1p2(bt_result)
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("対象レース数", f"{n_races_bt}件")
+                m2.metric("的中率", f"{hit_rate_bt:.1f}%")
+                m3.metric("回収率", f"{point:.1f}%")
+                st.caption(
+                    f"95%信頼区間(開催日×場単位のブロックブートストラップ、2000回): "
+                    f"{lo:.1f}%〜{hi:.1f}% / "
+                    "GroupKFold(5分割、レース単位)によるOut-of-Fold予測での検証であり、"
+                    "本番同様に未来データを使わずに予測した「真のフォワードテスト」とは"
+                    "厳密には異なる点に注意(同一期間内でのクロスバリデーション)。"
+                )
+
+                if n_races_bt < SAMPLE_SIZE_WARNING_THRESHOLD:
+                    st.warning("⚠️ 対象レース数が少なく、参考データ不足です。")
+
+                # --- 日ごとの投資額・払戻額 / 累計損益 ---
+                p1p2_daily = bt_result.groupby("race_date").agg(
+                    レース数=("stake", "size"), 投資額=("stake", "sum"), 払戻額=("ret", "sum")
+                )
+                p1p2_daily["払戻額"] = p1p2_daily["払戻額"].astype(int)
+                p1p2_daily["収支"] = p1p2_daily["払戻額"] - p1p2_daily["投資額"]
+                p1p2_daily["回収率(%)"] = np.where(
+                    p1p2_daily["投資額"] > 0, p1p2_daily["払戻額"] / p1p2_daily["投資額"] * 100, 0.0
+                ).round(1)
+                p1p2_daily = p1p2_daily.sort_index()
+                p1p2_daily["累計収支"] = p1p2_daily["収支"].cumsum()
+                p1p2_daily["累計投資額"] = p1p2_daily["投資額"].cumsum()
+                p1p2_daily["累計払戻額"] = p1p2_daily["払戻額"].cumsum()
+                p1p2_daily["累計回収率(%)"] = np.where(
+                    p1p2_daily["累計投資額"] > 0,
+                    p1p2_daily["累計払戻額"] / p1p2_daily["累計投資額"] * 100,
+                    0.0,
+                ).round(1)
+
+                p1p2_chart_df = p1p2_daily.reset_index().rename(columns={"race_date": "日付_raw"})
+                p1p2_chart_df["日付"] = p1p2_chart_df["日付_raw"].apply(fmt_date)
+
+                st.write("**(1) 日ごとの投資額・払戻額**")
+                st.bar_chart(p1p2_chart_df.set_index("日付")[["投資額", "払戻額"]])
+
+                st.write("**(2) 累計損益の推移**")
+                st.line_chart(p1p2_chart_df.set_index("日付")[["累計収支"]])
+
+                st.write("**(3) 日ごとの回収率の推移**")
+                st.line_chart(p1p2_chart_df.set_index("日付")[["回収率(%)"]])
+
+                if len(boot_rates_p1p2) > 0:
+                    hist_counts_p, bin_edges_p = np.histogram(boot_rates_p1p2, bins=30)
+                    hist_df_p = pd.DataFrame(
+                        {"回収率(%)": [f"{bin_edges_p[i]:.0f}" for i in range(len(bin_edges_p) - 1)],
+                         "頻度": hist_counts_p}
+                    ).set_index("回収率(%)")
+                    st.write("**(4) 回収率のブートストラップ分布(2000回)**")
+                    st.bar_chart(hist_df_p)
+
+                st.dataframe(
+                    p1p2_chart_df[
+                        ["日付", "レース数", "投資額", "払戻額", "回収率(%)", "累計収支", "累計回収率(%)"]
+                    ],
+                    hide_index=True, use_container_width=True,
+                )
 
 st.divider()
 
