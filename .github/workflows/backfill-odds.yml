@@ -11,7 +11,7 @@ on:
       limit:
         description: "1回の実行で処理するレース数の上限"
         required: false
-        default: "100"
+        default: "280"
 
 permissions:
   contents: write
@@ -24,9 +24,12 @@ concurrency:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    # 1レースあたり約1分(オッズ5ページ分)。デフォルト100件/回を
-    # 十分な余裕を持って処理できる時間を確保している。
-    timeout-minutes: 180
+    # 1レースあたり約1分(オッズ5ページ分)。実測(2026-09-01〜09-17の成功
+    # 15回)では100件/回=約90分で安定していたため、2026-09-18にデフォルトを
+    # 280件/回・timeout-minutesを300分に引き上げた(未着手分が29,425件/33,656件
+    # 残っており、100件/日だと完了まで約294日かかる見込みだったため)。
+    # 280件×約1分+チェックアウト/push分のバッファ約20分で300分以内に収まる想定。
+    timeout-minutes: 300
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -46,7 +49,7 @@ jobs:
 
       - name: Backfill odds for past races
         env:
-          LIMIT: ${{ github.event.inputs.limit || '100' }}
+          LIMIT: ${{ github.event.inputs.limit || '280' }}
         run: python boatrace_scraper.py --backfill-odds --backfill-odds-limit "$LIMIT"
 
       - name: Merge onto latest main and push
